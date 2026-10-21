@@ -1,28 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# tmux 経由で起動する (tmux は必須ではありません: python3 main.py でも動きます)
 
 SESSION="mac128k"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# ------------------------------------------------------------
-# tmux がインストールされているか確認
-# ------------------------------------------------------------
-
 if ! command -v tmux >/dev/null 2>&1; then
-    echo "tmux is not installed."
-    echo
-    echo "Install it with:"
-    echo "  sudo pacman -S tmux"
-    echo
-    exit 1
+    echo "tmux is not installed. Running without tmux."
+    cd "$SCRIPT_DIR" && exec python3 main.py
 fi
 
-# ------------------------------------------------------------
-# すでにtmuxの中にいる場合
-# ------------------------------------------------------------
-
 if [ -n "$TMUX" ]; then
-
-    # すでにmac128kセッションなら、そのまま使用
     CURRENT_SESSION="$(tmux display-message -p '#S')"
 
     if [ "$CURRENT_SESSION" = "$SESSION" ]; then
@@ -30,51 +17,19 @@ if [ -n "$TMUX" ]; then
         exit 0
     fi
 
-    # 別のtmuxセッションから実行した場合
-    echo "Already inside another tmux session:"
-    echo "  $CURRENT_SESSION"
-    echo
-    echo "Exit tmux first, then run:"
-    echo
-    echo "  ./mac128k_start.sh"
-    echo
-
+    echo "Already inside another tmux session: $CURRENT_SESSION"
+    echo "Run directly instead:  cd \"$SCRIPT_DIR\" && python3 main.py"
     exit 1
 fi
 
-# ------------------------------------------------------------
-# すでにmac128kセッションが存在する場合
-# ------------------------------------------------------------
-
 if tmux has-session -t "$SESSION" 2>/dev/null; then
-
-    tmux attach-session -t "$SESSION"
-
-    exit 0
+    exec tmux attach-session -t "$SESSION"
 fi
 
-# ------------------------------------------------------------
-# 新しいtmuxセッションを作成
-# ------------------------------------------------------------
+# python を直接セッションのコマンドにする (終了するとセッションも閉じる)
+tmux new-session -d -s "$SESSION" -c "$SCRIPT_DIR" "python3 main.py"
 
-tmux new-session \
-    -d \
-    -s "$SESSION" \
-    -c "$SCRIPT_DIR"
+# Esc の遅延を減らす (既定 500ms)
+tmux set-option -s escape-time 10
 
-# ------------------------------------------------------------
-# Macintosh TUIを起動
-# ------------------------------------------------------------
-
-tmux send-keys \
-    -t "$SESSION:0" \
-    "python3 main.py" \
-    C-m
-
-# ------------------------------------------------------------
-# Macintosh TUIへ接続
-# ------------------------------------------------------------
-
-tmux attach-session \
-    -t "$SESSION"
-
+exec tmux attach-session -t "$SESSION"

@@ -1,504 +1,86 @@
 # like_a_mac128K TUI
 
 A Macintosh 128K-inspired file manager for Linux terminals, written in Python and `curses`.
+Runs on ordinary Linux (tested on Arch Linux) and on a Raspberry Pi Zero.
 
-This project recreates the look and feel of the classic Macintosh Finder as a terminal-based user interface (TUI).
-
-It is designed to run on ordinary Linux systems and small computers such as the Raspberry Pi Zero.
-
-## Screenshot
-
-![Mac128K TUI](screenshot.png)
-
-> Screenshot optional. Place a screenshot named `screenshot.png` in the project directory.
-
----
-
-## Features
-
-### Desktop
-
-* Macintosh 128K-style desktop
-* File and folder icons
-* Desktop file management
-* Select files and folders
-* Drag and drop
-* Keyboard-mouse control
-
-### Windows
-
-* Open folders in Finder-style windows
-* Multiple windows
-* Active window handling
-* Window dragging
-* Window resizing
-* Window closing
-* File and folder scrolling
-* Automatic window positioning
-
-### File Operations
-
-* Open files and folders
-* Create new folders
-* Rename files and folders
-* Cut
-* Copy
-* Paste
-* Move files and folders
-* Delete to Trash
-* Undo file operations
-* Get Info
-
-### Trash
-
-* Macintosh-style Trash
-* Move files to Trash
-* Empty Trash
-* Undo Trash operations
-
-The project uses the standard XDG Trash location:
-
-```text
-~/.local/share/Trash/files
-~/.local/share/Trash/info
-```
-
-`send2trash` is used when available, with an XDG-compatible fallback implementation.
-
-### File Opening
-
-The project can launch several types of files from the terminal.
-
-Examples include:
-
-* Text files
-* Python files
-* Shell scripts
-* Images
-* Audio files
-* Video files
-* Executable files
-
-Terminal applications such as `nano` and `chafa` are used where appropriate.
-
----
-
-## Keyboard Mouse
-
-One of the goals of this project is to make the interface usable on computers where a real terminal mouse is unreliable.
-
-The `keyboard_mouse.py` module converts keyboard input into virtual `curses` mouse events.
-
-### Controls
-
-| Key     | Function                        |
-| ------- | ------------------------------- |
-| `W`     | Move pointer up                 |
-| `S`     | Move pointer down               |
-| `A`     | Move pointer left               |
-| `D`     | Move pointer right              |
-| `Space` | Left click                      |
-| `G`     | Press/release left mouse button |
-| `↑`     | Scroll up                       |
-| `↓`     | Scroll down                     |
-
-The keyboard mouse allows operations such as:
-
-```text
-G
-↓
-W/A/S/D
-↓
-G
-```
-
-to simulate dragging an item.
-
-This is particularly useful on Raspberry Pi systems where normal terminal mouse events may not work reliably.
-
----
-
-## Current Status
-
-The project is functional and has been tested on Arch Linux.
-
-The following operations are currently working:
-
-* Desktop navigation
-* Folder windows
-* Multiple windows
-* File selection
-* Folder selection
-* Mouse interaction
-* Keyboard mouse
-* Drag and drop
-* Window movement
-* Window resizing
-* File movement
-* Desktop ↔ window movement
-* Window ↔ window movement
-* Desktop → Trash
-* Empty Trash
-* Undo
-* Cut / Paste
-* Copy / Paste
-* Rename
-* New Folder
-* Get Info
-* File opening
-
-The project is still under development.
-
----
-
-## Known Issues
-
-### Raspberry Pi Zero keyboard mouse
-
-The keyboard mouse works correctly on Arch Linux.
-
-On a Raspberry Pi Zero, there is currently an issue where the `G` key does not behave correctly while `Space` can behave unexpectedly.
-
-The same source code works correctly on Arch Linux, so this may be related to the Raspberry Pi terminal/curses environment.
-
-Help from people familiar with:
-
-* Python `curses`
-* terminal input
-* Raspberry Pi
-* Linux TUI applications
-
-would be appreciated.
-
----
-
-## ASCII Mode
-
-Unicode characters can be problematic on small Linux systems and terminal configurations.
-
-The project therefore uses ASCII symbols for maximum compatibility.
-
-Current file/folder symbols are:
-
-```text
->  file
-
-#  folder
-```
-
-Other interface elements also have ASCII equivalents.
-
-The goal is to make the entire interface usable even on a minimal Raspberry Pi terminal.
-
----
-
-## Project Structure
-
-```text
-mac128k/
-│
-├── main.py
-├── events.py
-├── desktop.py
-├── filesystem.py
-├── constants.py
-├── keyboard_mouse.py
-├── menu.py
-├── trash.py
-├── windows.py
-│
-├── mac128k_start.sh
-├── chafa_video.sh
-
-```
-
-### `main.py`
-
-Main application entry point.
-
-Responsible for:
-
-* curses initialization
-* main event loop
-* application state
-* keyboard input
-* keyboard mouse integration
-* screen updates
-
-### `events.py`
-
-Handles user interaction and application events.
-
-Examples:
-
-* mouse events
-* selection
-* dragging
-* dropping
-* keyboard commands
-* menu actions
-
-### `desktop.py`
-
-Draws and manages the Macintosh-style desktop.
-
-Responsible for:
-
-* desktop icons
-* desktop selection
-* desktop interaction
-
-### `filesystem.py`
-
-Provides filesystem-related functionality.
-
-Responsible for:
-
-* reading directories
-* creating icons
-* creating folders
-* moving files
-* copying files
-* renaming files
-* opening files
-
-### `constants.py`
-
-Contains interface constants and symbols.
-
-Examples:
-
-```text
-FILE_SYMBOL
-DIR_SYMBOL
-TRASH_SYMBOL_EMPTY
-TRASH_SYMBOL_FULL
-POINTER_SYMBOL
-```
-
-The project currently favors ASCII symbols for compatibility.
-
-### `keyboard_mouse.py`
-
-Provides keyboard-controlled mouse emulation.
-
-It converts keyboard commands into `curses` mouse events using:
-
-```python
-curses.ungetmouse()
-```
-
-### `menu.py`
-
-Handles the Macintosh-style menu bar.
-
-Current menus include:
-
-```text
-Apple
-File
-Edit
-View
-Special
-```
-
-### `trash.py`
-
-Handles Trash functionality.
-
-Includes:
-
-* moving files to Trash
-* emptying Trash
-* restoring files through Undo
-
-### `windows.py`
-
-Handles Finder-style windows.
-
-Includes:
-
-* window creation
-* window drawing
-* window movement
-* resizing
-* scrolling
-* active window management
-
----
 ## Requirements
 
-### Required
-
-* Linux
-* Python 3
-* `curses`
-* `tmux`
-
-`tmux` is currently required because Mac128K TUI launches external programs in separate terminal windows.
-
-Install the basic requirements on Arch Linux:
+* Linux, Python 3.7+ (Raspberry Pi OS Buster or newer), `curses`
+* Optional: `tmux` (external programs open in a new tmux window; without tmux
+  the screen is suspended and the program runs in the foreground)
+* Optional: `nano` (or set `$EDITOR`), `chafa`, `ffmpeg`, `mpv`, `send2trash`
 
 ```bash
-sudo pacman -S python tmux
+# Arch
+sudo pacman -S python tmux nano chafa ffmpeg mpv
+# Raspberry Pi OS / Debian
+sudo apt install python3 tmux nano chafa ffmpeg mpv
 ```
-
-On Raspberry Pi OS / Debian:
-
-```bash
-sudo apt install python3 tmux
-```
-
-### Recommended
-
-The following programs are used by some file-opening features:
-
-* `nano`
-* `chafa`
-* `ffmpeg`
-
-For example, on Arch Linux:
-
-```bash
-sudo pacman -S nano chafa ffmpeg
-```
-
-On Raspberry Pi OS / Debian:
-
-```bash
-sudo apt install nano chafa ffmpeg
-```
-
-### Optional
-
-`send2trash` can be installed for Trash support:
-
-```bash
-pip install send2trash
-```
-
-The project also contains an XDG-compatible fallback, so `send2trash` is not strictly required.
-
 
 ## Running
 
-Clone the repository:
-
 ```bash
-git clone https://github.com/pirosawatrax/like_a_mac128k.git
-cd mac128k
+python3 main.py          # directly
+./mac128k_start.sh       # inside a tmux session (Esc delay is reduced)
 ```
 
-Run:
+## Keyboard mouse
 
-```bash
-tmux
-python3 main.py
-```
+| Key | Function |
+| --- | --- |
+| `W` `A` `S` `D` | Move pointer (the dragged item follows while the button is held) |
+| `Space` | Left click (press + release) |
+| `G` | Press / release left button (drag & drop) |
+| `Up` / `Down` | Mouse wheel |
+| `Enter` | Open selected item |
+| `Esc` | Cancel drag / close menu / close top window |
+| `Q` | Quit (asks for confirmation) |
 
-If using the supplied startup script:
+Dialogs: `Y` / `Enter` = Yes, `N` / `Esc` = No.
+While a dialog or the Rename box is open, `W A S D G Space` are typed as text.
 
-```bash
-./mac128k_start.sh
-```
+The keyboard mouse no longer uses `curses.ungetmouse()`. Events go through an
+internal queue, so behaviour does not depend on the ncurses version or on
+whether the terminal supports the mouse.
 
-Make it executable if necessary:
+## What changed from the previous version
 
-```bash
-chmod +x mac128k_start.sh
-```
+* Keyboard mouse: own event queue, drag follows keyboard movement, pointer
+  position synced with a real mouse, stuck button state self-heals
+* Rename: no key conflicts, Japanese input (`get_wch`), cursor movement
+* Wide (CJK) characters are measured by display width
+* Trash status is cached (no `listdir` per frame); drop-to-Trash works from windows too
+* Clicking a folder no longer tries to move it into itself
+* Executables / scripts ask for confirmation before running
+* Desktop scrolls (wheel) instead of stacking overflowing icons; dotfiles hidden
+  by default (View > Show Hidden)
+* Icon positions are preserved across file operations
+* Multi-level Undo (move / trash / rename / copy)
+* Terminal resize is handled; `Esc` responds quickly (`ESCDELAY`)
+* Events are batched: many queued mouse-move events cause only one redraw
 
----
-
-## Raspberry Pi Zero
-
-The project was also developed with Raspberry Pi Zero WH in mind.
-
-A minimal Raspberry Pi OS installation can be used without a desktop environment.
-
-The application is intended to run directly in a terminal.
-
-For example:
+## Files
 
 ```text
-Raspberry Pi Zero
-        │
-        └── Raspberry Pi OS Lite
-                  │
-                  └── Terminal
-                         │
-                         └── Mac128K TUI
+main.py            entry point, main loop, key reading
+events.py          mouse / keyboard handling, file operations, menu actions
+desktop.py         desktop drawing and layout calculations
+windows.py         Finder-style windows
+menu.py            menu bar
+trash.py           XDG Trash (send2trash optional)
+launcher.py        opening files (tmux window or foreground)
+filesystem.py      directory reading, icon layout
+keyboard_mouse.py  keyboard -> virtual mouse events
+textutil.py        display-width helpers, safe drawing
+constants.py       settings and symbols
+mac128k_start.sh / chafa_video.sh
 ```
 
-This makes it possible to use a Macintosh-style graphical interface concept on very small hardware without running a conventional graphical desktop environment.
+## Reporting problems
 
----
-
-## Philosophy
-
-The goal is not to reproduce macOS.
-
-Instead, this project explores what a Macintosh Finder-like interface might feel like when rebuilt entirely inside a Linux terminal.
-
-The limitations of a TUI are part of the experiment.
-
-```text
-Macintosh 128K
-      ↓
-Finder
-      ↓
-Terminal
-      ↓
-Python + curses
-      ↓
-Mac128K TUI
-```
-
-The project also deliberately targets older and low-powered hardware such as the Raspberry Pi Zero.
-
----
-
-## Contributing
-
-Contributions, bug reports, ideas, and experiments are welcome.
-
-In particular, help with the following would be appreciated:
-
-* Raspberry Pi Zero `curses` input
-* terminal mouse compatibility
-* keyboard mouse improvements
-* Finder-style UI improvements
-* Raspberry Pi performance
-* Unicode/ASCII terminal compatibility
-* additional file operations
-
-If you find a bug, please include:
-
-1. Linux distribution
-2. Python version
-3. Terminal type
-
-For example:
-
-```bash
-uname -a
-python3 --version
-echo "$TERM"
-```
-
-and describe the steps that reproduce the problem.
-
----
-
+Please include `uname -a`, `python3 --version`, `echo "$TERM"`, and
+`python3 -c "import curses; print(curses.ncurses_version)"`.
 
 ## License
 
 Free to use, modify, and redistribute.
-
-## Project Status
-
-**Experimental / Work in Progress**
-
-The project is usable, but development is ongoing.
-
-The ultimate goal is a small, self-contained Macintosh-inspired TUI that can run comfortably on both a modern Linux desktop and tiny systems such as the Raspberry Pi Zero.

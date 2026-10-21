@@ -1,75 +1,71 @@
+# ============================================================
+# keyboard_mouse.py
+# キーボード → 仮想マウスイベント
+#
+# curses.ungetmouse は使わない。
+# (ncurses 内部キューの順序・端末のマウス対応有無に左右されるため)
+# 代わりに自前の FIFO キューへ積み、main ループが直接処理する。
+#
+#   W/A/S/D : ポインタ移動 (ボタン押下中なら移動イベントも出す)
+#   Space   : クリック (press → release)
+#   G       : 左ボタン 押す / 離す
+#   ↑ / ↓   : ホイール
+# ============================================================
+
 import curses
+from collections import deque
+
+WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0)
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)
+MOTION = getattr(curses, "REPORT_MOUSE_POSITION", 0)
 
 
 class KeyboardMouse:
-    """
-    キーボード入力をcursesのマウス操作へ変換する。
-
-    W/S/A/D  : マウスカーソル移動
-    ↑ / ↓    : ホイール
-    G        : 左ボタン押下 / 離す
-    Space    : 左クリック
-    """
 
     def __init__(self, x=1, y=1):
 
         self.x = x
         self.y = y
-
         self.left_button_down = False
 
+        # (id, x, y, z, bstate) — curses.getmouse() と同じ形式
+        self.queue = deque()
+
     # --------------------------------------------------------
-    # マウスカーソル移動
-    # --------------------------------------------------------
+
+    def sync(self, x, y):
+        """実マウス等で動いた位置に合わせる"""
+        self.x = x
+        self.y = y
 
     def move(self, key, width, height):
 
+        dx = 0
+        dy = 0
+
         if key in (ord("w"), ord("W")):
-            self.y -= 1
-
+            dy = -1
         elif key in (ord("s"), ord("S")):
-            self.y += 1
-
+            dy = 1
         elif key in (ord("a"), ord("A")):
-            self.x -= 1
-
+            dx = -1
         elif key in (ord("d"), ord("D")):
-            self.x += 1
-
+            dx = 1
         else:
             return False
 
-        # 画面外へ出ないようにする
+        self.x = max(1, min(width - 2, self.x + dx))
+        self.y = max(1, min(height - 2, self.y + dy))
 
-        self.x = max(
-            1,
-            min(width - 2, self.x)
-        )
-
-        self.y = max(
-            1,
-            min(height - 2, self.y)
-        )
+        # ドラッグ中はアイコン等が追従するよう移動イベントを出す
+        if self.left_button_down:
+            self._event(MOTION)
 
         return True
 
-    # --------------------------------------------------------
-    # 左クリック
-    # --------------------------------------------------------
-
     def click(self):
-
-        self._mouse_event(
-            curses.BUTTON1_PRESSED
-        )
-
-        self._mouse_event(
-            curses.BUTTON1_RELEASED
-        )
-
-    # --------------------------------------------------------
-    # 左ボタン押下
-    # --------------------------------------------------------
+        self._event(curses.BUTTON1_PRESSED)
+        self._event(curses.BUTTON1_RELEASED)
 
     def press_left(self):
 
@@ -77,14 +73,7 @@ class KeyboardMouse:
             return
 
         self.left_button_down = True
-
-        self._mouse_event(
-            curses.BUTTON1_PRESSED
-        )
-
-    # --------------------------------------------------------
-    # 左ボタン離す
-    # --------------------------------------------------------
+        self._event(curses.BUTTON1_PRESSED)
 
     def release_left(self):
 
@@ -92,14 +81,7 @@ class KeyboardMouse:
             return
 
         self.left_button_down = False
-
-        self._mouse_event(
-            curses.BUTTON1_RELEASED
-        )
-
-    # --------------------------------------------------------
-    # Gキー
-    # --------------------------------------------------------
+        self._event(curses.BUTTON1_RELEASED)
 
     def toggle_drag(self):
 
@@ -108,42 +90,20 @@ class KeyboardMouse:
         else:
             self.press_left()
 
-    # --------------------------------------------------------
-    # ホイール上
-    # --------------------------------------------------------
-
     def scroll_up(self):
-
-        self._mouse_event(
-            curses.BUTTON4_PRESSED
-        )
-
-    # --------------------------------------------------------
-    # ホイール下
-    # --------------------------------------------------------
+        self._event(WHEEL_UP)
 
     def scroll_down(self):
+        self._event(WHEEL_DOWN)
 
-        self._mouse_event(
-            curses.BUTTON5_PRESSED
-        )
+    def heal(self, dragging):
+        """
+        何もドラッグしていないのに「押した状態」で残らないようにする
+        (空きスペースで G を押した、Esc でドラッグを取り消した、など)
+        """
 
-    # --------------------------------------------------------
-    # 仮想マウスイベントを発生
-    # --------------------------------------------------------
+        if self.left_button_down and not dragging:
+            self.left_button_down = False
 
-    def _mouse_event(self, button):
-
-        try:
-
-            curses.ungetmouse(
-                0,
-                self.x,
-                self.y,
-                0,
-                button,
-            )
-
-        except curses.error:
-
-            pass
+    def _event(self, button):
+        self.queue.append((0, self.x, self.y, 0, button))

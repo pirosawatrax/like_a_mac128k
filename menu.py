@@ -7,18 +7,12 @@ import curses
 
 from constants import (
     APPLE_SYMBOL,
-    WINDOW_TL,
-    WINDOW_TR,
-    WINDOW_BL,
-    WINDOW_BR,
-    WINDOW_H,
-    WINDOW_V,
+    WINDOW_TL, WINDOW_TR, WINDOW_BL, WINDOW_BR,
+    WINDOW_H, WINDOW_V,
 )
 
+from textutil import put
 
-# ============================================================
-# メニューバー
-# ============================================================
 
 MENU_ITEMS = [
     (APPLE_SYMBOL, 3),
@@ -28,16 +22,13 @@ MENU_ITEMS = [
     ("Special", 29),
 ]
 
-
-# ============================================================
-# メニュー内容
-# ============================================================
+SEPARATOR = "----------------"
 
 MENUS = {
 
     APPLE_SYMBOL: [
         "About This Macintosh",
-        "----------------",
+        SEPARATOR,
         "Control Panel",
         "Calculator",
     ],
@@ -48,14 +39,15 @@ MENUS = {
         "Open",
         "Open in Editor",
         "Get Info",
+        "Put Back",
         "Close",
-        "----------------",
+        SEPARATOR,
         "Quit",
     ],
 
     "Edit": [
         "Undo",
-        "----------------",
+        SEPARATOR,
         "Cut",
         "Copy",
         "Paste",
@@ -67,248 +59,109 @@ MENUS = {
         "by Icon",
         "by Name",
         "by Date",
-        "----------------",
+        SEPARATOR,
         "Clean Up",
+        "Show Hidden",
     ],
 
     "Special": [
         "Empty Trash",
-        "----------------",
+        SEPARATOR,
         "Restart",
         "Shut Down",
     ],
 }
 
 
-# ============================================================
-# メニュー判定
-# ============================================================
+def is_separator(item):
+    return item.startswith("-")
 
-def menu_at(x, y):
-    """
-    指定座標のメニュー名を返す
-    """
-
-    if y != 1:
-        return None
-
-    for name, start_x in MENU_ITEMS:
-
-        if start_x <= x < start_x + len(name):
-            return name
-
-    return None
-
-
-# ============================================================
-# メニューバー描画
-# ============================================================
-
-def draw_menu_bar(stdscr):
-
-    height, width = stdscr.getmaxyx()
-
-    try:
-
-        stdscr.addnstr(
-            1,
-            1,
-            " " * max(1, width - 2),
-            max(1, width - 2),
-        )
-
-        for name, x in MENU_ITEMS:
-
-            stdscr.addstr(
-                1,
-                x,
-                name,
-            )
-
-    except curses.error:
-        pass
-
-
-# ============================================================
-# ポップアップメニュー描画
-# ============================================================
-
-def draw_popup_menu(
-    stdscr,
-    menu_name,
-    menu_x,
-):
-
-    height, width = stdscr.getmaxyx()
-
-    items = MENUS[menu_name]
-
-    menu_width = (
-        max(
-            len(item)
-            for item in items
-        )
-        + 4
-    )
-
-    menu_height = len(items) + 2
-
-    if menu_x + menu_width >= width - 1:
-        menu_x = (
-            width
-            - menu_width
-            - 1
-        )
-
-    menu_y = 2
-
-    try:
-
-        # ----------------------------------------------------
-        # 上枠
-        # ----------------------------------------------------
-
-        stdscr.addstr(
-            menu_y,
-            menu_x,
-            WINDOW_TL
-            + WINDOW_H * (menu_width - 2)
-            + WINDOW_TR,
-        )
-
-        # ----------------------------------------------------
-        # 本体
-        # ----------------------------------------------------
-
-        for i, item in enumerate(items):
-
-            y = menu_y + 1 + i
-
-            if item.startswith("-"):
-
-                text = (
-                    WINDOW_V
-                    + WINDOW_H * (menu_width - 2)
-                    + WINDOW_V
-                )
-
-            else:
-
-                text = (
-                    WINDOW_V
-                    + " "
-                    + item.ljust(
-                        menu_width - 4
-                    )
-                    + " "
-                    + WINDOW_V
-                )
-
-            stdscr.addnstr(
-                y,
-                menu_x,
-                text,
-                menu_width,
-            )
-
-        # ----------------------------------------------------
-        # 下枠
-        # ----------------------------------------------------
-
-        stdscr.addstr(
-            menu_y + menu_height - 1,
-            menu_x,
-            WINDOW_BL
-            + WINDOW_H * (menu_width - 2)
-            + WINDOW_BR,
-        )
-
-    except curses.error:
-        pass
-
-
-# ============================================================
-# メニュー幅取得
-# ============================================================
 
 def menu_width(menu_name):
 
     if menu_name not in MENUS:
         return 0
 
-    return (
-        max(
-            len(item)
-            for item in MENUS[menu_name]
-        )
-        + 4
-    )
+    return max(len(item) for item in MENUS[menu_name]) + 4
 
 
-# ============================================================
-# メニュー項目取得
-# ============================================================
+def popup_origin(menu_name, menu_x, screen_width):
+    """画面右端にはみ出さない X 座標 (描画とクリック判定で共通)"""
 
-def menu_items(menu_name):
+    width = menu_width(menu_name)
 
-    return MENUS.get(
-        menu_name,
-        [],
-    )
+    if menu_x + width >= screen_width - 1:
+        menu_x = screen_width - width - 1
 
-
-# ============================================================
-# 区切り線か判定
-# ============================================================
-
-def is_separator(item):
-
-    return item.startswith("-")
+    return max(1, menu_x)
 
 
-# ============================================================
-# ポップアップ内クリック判定
-# ============================================================
+def menu_at(x, y):
 
-def menu_item_at(
-    menu_name,
-    menu_x,
-    mouse_x,
-    mouse_y,
-):
+    if y != 1:
+        return None
+
+    for name, start_x in MENU_ITEMS:
+        if start_x <= x < start_x + len(name):
+            return name
+
+    return None
+
+
+def draw_menu_bar(stdscr, active_menu=None):
+
+    height, width = stdscr.getmaxyx()
+
+    put(stdscr, 1, 1, " " * max(1, width - 2), width - 2)
+
+    for name, x in MENU_ITEMS:
+
+        attr = curses.A_REVERSE if name == active_menu else 0
+        put(stdscr, 1, x, name, None, attr)
+
+
+def draw_popup_menu(stdscr, menu_name, menu_x):
+
+    height, width = stdscr.getmaxyx()
 
     items = MENUS[menu_name]
+    w = menu_width(menu_name)
+    x = popup_origin(menu_name, menu_x, width)
+    y = 2
 
-    menu_width = (
-        max(
-            len(item)
-            for item in items
-        )
-        + 4
-    )
+    put(stdscr, y, x, WINDOW_TL + WINDOW_H * (w - 2) + WINDOW_TR, w)
 
-    menu_y = 2
+    for i, item in enumerate(items):
 
-    item_index = (
-        mouse_y
-        - menu_y
-        - 1
-    )
+        if is_separator(item):
+            text = WINDOW_V + WINDOW_H * (w - 2) + WINDOW_V
+        else:
+            text = WINDOW_V + " " + item.ljust(w - 4) + " " + WINDOW_V
 
-    if not (
-        menu_x <= mouse_x < menu_x + menu_width
-    ):
+        put(stdscr, y + 1 + i, x, text, w)
+
+    put(stdscr, y + len(items) + 1, x,
+        WINDOW_BL + WINDOW_H * (w - 2) + WINDOW_BR, w)
+
+
+def menu_item_at(menu_name, mouse_x, mouse_y, screen_width):
+    """ポップアップ内の項目名 (区切り線や枠外は None)"""
+
+    items = MENUS[menu_name]
+    w = menu_width(menu_name)
+    x = popup_origin(menu_name, dict(MENU_ITEMS)[menu_name], screen_width)
+
+    index = mouse_y - 3
+
+    if not (x <= mouse_x < x + w):
         return None
 
-    if not (
-        0 <= item_index < len(items)
-    ):
+    if not (0 <= index < len(items)):
         return None
 
-    item = items[item_index]
+    item = items[index]
 
     if is_separator(item):
         return None
 
     return item
-

@@ -1,8 +1,6 @@
 # ============================================================
 # desktop.py
-# Finder風デスクトップ描画
-#
-# Arch Linux / Raspberry Pi Zero 対応
+# Finder風デスクトップ描画 と 画面レイアウト計算
 # ============================================================
 
 import curses
@@ -10,6 +8,9 @@ import curses
 from constants import (
     HOME,
     POINTER_SYMBOL,
+    DESKTOP_COLUMN_WIDTH,
+    WINDOW_TL, WINDOW_TR, WINDOW_BL, WINDOW_BR,
+    WINDOW_H, WINDOW_V,
 )
 
 from menu import (
@@ -18,723 +19,303 @@ from menu import (
     draw_popup_menu,
 )
 
-from windows import (
-    draw_window,
-)
+from windows import draw_window
+from trash import trash_symbol
+from textutil import put, fit, text_width
 
-from trash import (
-    trash_symbol,
-)
+DESKTOP_LABEL_W = DESKTOP_COLUMN_WIDTH - 1
+DESKTOP_TOP = 3
 
 
 # ============================================================
-# デスクトップアイコン描画
+# レイアウト計算 (描画とイベント処理で共有)
 # ============================================================
 
-def draw_desktop_icons(stdscr, icons, selected):
+def trash_origin(width, height):
+    return width - 14, height - 5
+
+
+def point_in_trash(width, height, x, y):
+
+    tx, ty = trash_origin(width, height)
+
+    return ty <= y <= ty + 1 and tx <= x < tx + 12
+
+
+def desktop_bottom(height):
+    """アイコンを置ける最下行 (Trash の行を避ける)"""
+    return height - 6
+
+
+def desktop_max_scroll(icons, height):
+
+    if not icons:
+        return 0
+
+    return max(0, max(i["y"] for i in icons) - desktop_bottom(height))
+
+
+def desktop_icon_at(state, x, y, height, exclude=None):
+
+    scroll = state["desktop_scroll"]
+
+    for icon in reversed(state["desktop_icons"]):
+
+        if icon is exclude:
+            continue
+
+        sy = icon["y"] - scroll
+
+        if sy < DESKTOP_TOP or sy > desktop_bottom(height):
+            continue
+
+        if icon["x"] <= x < icon["x"] + DESKTOP_LABEL_W and sy <= y <= sy + 1:
+            return icon
+
+    return None
+
+
+def confirm_layout(width, height, dialog):
+
+    message = dialog.get("message", "")
+
+    w = min(max(40, text_width(message) + 8), max(20, width - 2))
+    h = 7
+    x = max(0, (width - w) // 2)
+    y = max(0, (height - h) // 2)
+
+    buttons = "[ Yes ]    [ No ]"
+    bx = x + (w - len(buttons)) // 2
+
+    return {
+        "x": x, "y": y, "w": w, "h": h,
+        "btn_y": y + 4,
+        "yes": (bx, bx + 7),
+        "no": (bx + 11, bx + 17),
+        "buttons_x": bx,
+    }
+
+
+def rename_layout(width, height):
+
+    w = max(24, min(50, width - 4))
+    h = 7
+
+    return max(0, (width - w) // 2), max(0, (height - h) // 2), w, h
+
+
+def info_layout(width, height, info):
+
+    lines = info.get("lines", [])
+
+    w = max(24, min(56, width - 4))
+    h = min(len(lines) + 7, max(8, height - 2))
+
+    return max(0, (width - w) // 2), max(0, (height - h) // 2), w, h
+
+
+# ============================================================
+# 部品
+# ============================================================
+
+def draw_box(stdscr, x, y, w, h, attr=0):
+
+    inner = " " * (w - 2)
+
+    put(stdscr, y, x, WINDOW_TL + WINDOW_H * (w - 2) + WINDOW_TR, w, attr)
+
+    for row in range(y + 1, y + h - 1):
+        put(stdscr, row, x, WINDOW_V + inner + WINDOW_V, w, attr)
+
+    put(stdscr, y + h - 1, x,
+        WINDOW_BL + WINDOW_H * (w - 2) + WINDOW_BR, w, attr)
+
+
+def draw_desktop_icons(stdscr, state):
+
     height, width = stdscr.getmaxyx()
 
-    for icon in icons:
-        x = icon["x"]
-        y = icon["y"]
+    scroll = state["desktop_scroll"]
+    selected = state["desktop_selected"]
 
-        # 画面外のアイコンは描画しない
-        if y < 1 or y >= height - 3:
+    for icon in state["desktop_icons"]:
+
+        sy = icon["y"] - scroll
+        x = icon["x"]
+
+        if sy < DESKTOP_TOP or sy > desktop_bottom(height):
             continue
 
         if x < 1 or x >= width - 1:
             continue
 
-        symbol = icon.get("symbol", "")
-        name = icon.get("name", "")
-
         if icon is selected:
-            text = f"[{symbol} {name}]"
+            text = "[{} {}]".format(icon["symbol"], icon["label"])
         else:
-            text = f" {symbol} {name} "
+            text = " {} {} ".format(icon["symbol"], icon["label"])
 
-        # 画面右端を絶対に越えない
-        max_len = width - x - 1
-
-        if max_len <= 0:
-            continue
-
-        try:
-            stdscr.addnstr(
-                y,
-                x,
-                text,
-                max_len,
-            )
-        except curses.error:
-            pass
+        put(stdscr, sy, x, text, min(DESKTOP_LABEL_W, width - x - 1))
 
 
-# ============================================================
-# Trash描画
-# ============================================================
-
-def draw_trash(
-    stdscr,
-    selected=False,
-):
+def draw_trash(stdscr, selected=False):
 
     height, width = stdscr.getmaxyx()
 
-    trash_x = width - 14
-    trash_y = height - 5
-
+    x, y = trash_origin(width, height)
     symbol = trash_symbol()
 
-    # --------------------------------------------------------
-    # 選択状態
-    # --------------------------------------------------------
+    text = "[{} Trash]" if selected else " {} Trash "
 
-    if selected:
-
-        text = (
-            f"[{symbol} Trash]"
-        )
-
-    else:
-
-        text = (
-            f" {symbol} Trash "
-        )
-
-    try:
-
-        stdscr.addnstr(
-            trash_y,
-            trash_x,
-            text,
-            max(
-                1,
-                width - trash_x - 1,
-            ),
-        )
-
-    except curses.error:
-
-        pass
+    put(stdscr, y, x, text.format(symbol), max(1, width - x - 1))
 
 
-# ============================================================
-# ウィンドウ群描画
-# ============================================================
-
-def draw_windows(
-    stdscr,
-    windows,
-    active_window,
-):
-
-    for window in windows:
-
-        draw_window(
-            stdscr,
-            window,
-            window is active_window,
-        )
-
-
-# ============================================================
-# ポインタ描画
-# ============================================================
-
-def draw_pointer(
-    stdscr,
-    mouse_x,
-    mouse_y,
-):
+def draw_desktop_title(stdscr):
 
     height, width = stdscr.getmaxyx()
 
-    if not (
-        1 <= mouse_x < width - 1
-    ):
-        return
-
-    if not (
-        1 <= mouse_y < height - 1
-    ):
-        return
-
-    try:
-
-        stdscr.addch(
-            mouse_y,
-            mouse_x,
-            POINTER_SYMBOL,
-        )
-
-    except curses.error:
-
-        pass
+    put(stdscr, 2, 3, " {} ".format(HOME), max(1, width - 6))
 
 
-# ============================================================
-# メッセージ表示
-# ============================================================
-
-def draw_message(
-    stdscr,
-    message,
-):
-
-    height, width = stdscr.getmaxyx()
+def draw_message(stdscr, message):
 
     if message is None:
         return
 
-    try:
+    height, width = stdscr.getmaxyx()
 
-        stdscr.addnstr(
-            height - 2,
-            2,
-            str(message),
-            max(
-                1,
-                width - 4,
-            ),
-        )
+    put(stdscr, height - 2, 2, str(message), max(1, width - 4))
 
-    except curses.error:
 
-        pass
+def draw_pointer(stdscr, x, y):
+
+    height, width = stdscr.getmaxyx()
+
+    if 1 <= x < width - 1 and 1 <= y < height - 1:
+        put(stdscr, y, x, POINTER_SYMBOL, 1, curses.A_BOLD)
+
 
 # ============================================================
-# 確認ダイアログ描画
+# ダイアログ
 # ============================================================
 
-def draw_confirm_dialog(
-    stdscr,
-    dialog,
-):
+def draw_confirm_dialog(stdscr, dialog):
 
     if dialog is None:
         return
 
     height, width = stdscr.getmaxyx()
+    lay = confirm_layout(width, height, dialog)
 
-    message = dialog.get(
-        "message",
-        "",
-    )
+    attr = curses.A_REVERSE
 
-    # --------------------------------------------------------
-    # ダイアログサイズ
-    # --------------------------------------------------------
+    draw_box(stdscr, lay["x"], lay["y"], lay["w"], lay["h"], attr)
 
-    dialog_w = max(
-        40,
-        len(message) + 8,
-    )
+    message = fit(dialog.get("message", ""), lay["w"] - 4)
+    mx = lay["x"] + (lay["w"] - text_width(message)) // 2
 
-    dialog_w = min(
-        dialog_w,
-        width - 4,
-    )
+    put(stdscr, lay["y"] + 2, mx, message, None, attr)
+    put(stdscr, lay["btn_y"], lay["buttons_x"], "[ Yes ]    [ No ]",
+        None, attr)
 
-    dialog_h = 7
+    hint = "Y / Enter : Yes     N / Esc : No"
+    hx = lay["x"] + (lay["w"] - len(hint)) // 2
 
-    dialog_x = (
-        width - dialog_w
-    ) // 2
-
-    dialog_y = (
-        height - dialog_h
-    ) // 2
-
-    # --------------------------------------------------------
-    # ダイアログ背景を消す
-    # --------------------------------------------------------
-
-    try:
-
-        blank = " " * dialog_w
-
-        for y in range(
-            dialog_y,
-            dialog_y + dialog_h,
-        ):
-
-            stdscr.addstr(
-                y,
-                dialog_x,
-                blank,
-            )
-
-        # ----------------------------------------------------
-        # 枠
-        # ----------------------------------------------------
-
-        stdscr.addstr(
-            dialog_y,
-            dialog_x,
-            "┌"
-            + "─" * (dialog_w - 2)
-            + "┐",
-        )
-
-        for y in range(
-            dialog_y + 1,
-            dialog_y + dialog_h - 1,
-        ):
-
-            stdscr.addstr(
-                y,
-                dialog_x,
-                "│",
-            )
-
-            stdscr.addstr(
-                y,
-                dialog_x + dialog_w - 1,
-                "│",
-            )
-
-        stdscr.addstr(
-            dialog_y + dialog_h - 1,
-            dialog_x,
-            "└"
-            + "─" * (dialog_w - 2)
-            + "┘",
-        )
-
-        # ----------------------------------------------------
-        # メッセージ
-        # ----------------------------------------------------
-
-        message_x = (
-            dialog_x
-            + (
-                dialog_w
-                - len(message)
-            ) // 2
-        )
-
-        stdscr.addstr(
-            dialog_y + 2,
-            message_x,
-            message,
-        )
-
-        # ----------------------------------------------------
-        # ボタン
-        # ----------------------------------------------------
-
-        buttons = (
-            "[ Yes ]"
-            + "    "
-            + "[ No ]"
-        )
-
-        buttons_x = (
-            dialog_x
-            + (
-                dialog_w
-                - len(buttons)
-            ) // 2
-        )
-
-        stdscr.addstr(
-            dialog_y + 4,
-            buttons_x,
-            buttons,
-        )
-
-    except curses.error:
-
-        pass
+    put(stdscr, lay["y"] + 5, hx, hint, lay["w"] - 2, attr)
 
 
-# ============================================================
-# デスクトップタイトル
-# ============================================================
-
-def draw_desktop_title(
-    stdscr,
-):
-
-    height, width = stdscr.getmaxyx()
-
-    try:
-
-        stdscr.addnstr(
-            2,
-            3,
-            f" {HOME} ",
-            max(
-                1,
-                width - 6,
-            ),
-        )
-
-    except curses.error:
-
-        pass
-
-
-# ============================================================
-# アクティブメニュー
-# ============================================================
-
-def draw_active_menu(
-    stdscr,
-    active_menu,
-):
-
-    if active_menu is None:
-        return
-
-    menu_x = dict(
-        MENU_ITEMS
-    )[active_menu]
-
-    draw_popup_menu(
-        stdscr,
-        active_menu,
-        menu_x,
-    )
-
-
-# ============================================================
-# Finder画面全体描画
-# ============================================================
-
-def draw_screen(
-    stdscr,
-    desktop_icons,
-    desktop_selected,
-    windows,
-    active_window,
-    active_menu,
-    trash_selected,
-    mouse_x,
-    mouse_y,
-    message,
-    dialog,
-    rename,
-    info,
-):
-
-    stdscr.erase()
-
-    stdscr.border()
-
-    draw_menu_bar(
-        stdscr
-    )
-
-    draw_desktop_title(
-        stdscr
-    )
-
-    draw_desktop_icons(
-        stdscr,
-        desktop_icons,
-        desktop_selected,
-    )
-
-    draw_trash(
-        stdscr,
-        trash_selected,
-    )
-
-    draw_windows(
-        stdscr,
-        windows,
-        active_window,
-    )
-
-    draw_active_menu(
-        stdscr,
-        active_menu,
-    )
-
-    draw_pointer(
-        stdscr,
-        mouse_x,
-        mouse_y,
-    )
-
-    draw_message(
-        stdscr,
-        message,
-    )
-    
-    draw_confirm_dialog(
-        stdscr,
-        dialog,
-    )
-    draw_rename_dialog(
-        stdscr,
-        rename,
-    )    
-    draw_info_dialog(
-        stdscr,
-        info,
-    )
-
-    stdscr.refresh()
-# ============================================================
-# Renameダイアログ
-# ============================================================
-
-def draw_rename_dialog(
-    stdscr,
-    rename,
-):
+def draw_rename_dialog(stdscr, rename):
 
     if rename is None:
         return
 
-    height, width = (
-        stdscr.getmaxyx()
-    )
+    height, width = stdscr.getmaxyx()
+    x, y, w, h = rename_layout(width, height)
 
-    dialog_w = 50
-    dialog_h = 7
+    attr = curses.A_REVERSE
 
-    dialog_x = (
-        width - dialog_w
-    ) // 2
+    draw_box(stdscr, x, y, w, h, attr)
 
-    dialog_y = (
-        height - dialog_h
-    ) // 2
+    put(stdscr, y + 1, x + 2, "Rename", None, attr)
 
-    try:
+    name = rename.get("name", "")
+    cursor = rename.get("cursor", len(name))
+    field_w = w - 6
 
-        # ----------------------------------------------------
-        # 背景を白黒反転で塗りつぶす
-        # ----------------------------------------------------
+    # カーソルが見える範囲だけを表示する
+    start = 0
 
-        blank = " " * dialog_w
+    while text_width(name[start:cursor]) > field_w - 1:
+        start += 1
 
-        for y in range(
-            dialog_y,
-            dialog_y + dialog_h,
-        ):
+    put(stdscr, y + 3, x + 2, fit(name[start:], field_w), field_w, attr)
 
-            stdscr.addstr(
-                y,
-                dialog_x,
-                blank,
-                curses.A_REVERSE,
-            )
+    cx = x + 2 + text_width(name[start:cursor])
+    cursor_ch = name[cursor] if cursor < len(name) else " "
 
-        # ----------------------------------------------------
-        # 枠
-        # ----------------------------------------------------
+    put(stdscr, y + 3, cx, cursor_ch, 2, curses.A_NORMAL)
 
-        stdscr.addstr(
-            dialog_y,
-            dialog_x,
-            "+" + "-" * (dialog_w - 2) + "+",
-            curses.A_REVERSE,
-        )
+    put(stdscr, y + 5, x + 2, "[ Enter ] OK    [ Esc ] Cancel",
+        w - 4, attr)
 
-        stdscr.addstr(
-            dialog_y + dialog_h - 1,
-            dialog_x,
-            "+" + "-" * (dialog_w - 2) + "+",
-            curses.A_REVERSE,
-        )
 
-        # ----------------------------------------------------
-        # タイトル
-        # ----------------------------------------------------
-
-        stdscr.addstr(
-            dialog_y + 1,
-            dialog_x + 2,
-            "Rename",
-            curses.A_REVERSE,
-        )
-
-        # ----------------------------------------------------
-        # 名前
-        # ----------------------------------------------------
-
-        name = rename.get(
-            "name",
-            "",
-        )
-
-        stdscr.addstr(
-            dialog_y + 3,
-            dialog_x + 2,
-            name[:dialog_w - 6],
-            curses.A_REVERSE,
-        )
-
-        # ----------------------------------------------------
-        # 操作説明
-        # ----------------------------------------------------
-
-        stdscr.addstr(
-            dialog_y + 5,
-            dialog_x + 2,
-            "[ Enter ]    [ Esc ]",
-            curses.A_REVERSE,
-        )
-
-    except curses.error:
-
-        pass
-# ============================================================
-# Get Info ダイアログ
-# ============================================================
-
-def draw_info_dialog(
-    stdscr,
-    info,
-):
+def draw_info_dialog(stdscr, info):
 
     if info is None:
         return
 
     height, width = stdscr.getmaxyx()
+    x, y, w, h = info_layout(width, height, info)
 
-    dialog_w = 56
-    dialog_h = 12
+    attr = curses.A_REVERSE
 
-    dialog_w = min(
-        dialog_w,
-        width - 4,
-    )
+    draw_box(stdscr, x, y, w, h, attr)
 
-    dialog_h = min(
-        dialog_h,
-        height - 4,
-    )
+    put(stdscr, y + 1, x + 2, info.get("title", ""), w - 4, attr)
 
-    dialog_x = (
-        width - dialog_w
-    ) // 2
+    for i, line in enumerate(info.get("lines", [])):
 
-    dialog_y = (
-        height - dialog_h
-    ) // 2
+        if y + 3 + i >= y + h - 2:
+            break
 
-    try:
+        put(stdscr, y + 3 + i, x + 3, line, w - 6, attr)
 
-        # ----------------------------------------------------
-        # 背景
-        # ----------------------------------------------------
+    close_text = "[ Enter / Esc ]"
 
-        blank = " " * dialog_w
+    put(stdscr, y + h - 2, x + (w - len(close_text)) // 2,
+        close_text, None, attr)
 
-        for y in range(
-            dialog_y,
-            dialog_y + dialog_h,
-        ):
 
-            stdscr.addstr(
-                y,
-                dialog_x,
-                blank,
-                curses.A_REVERSE,
-            )
+# ============================================================
+# 画面全体
+# ============================================================
 
-        # ----------------------------------------------------
-        # 枠
-        # ----------------------------------------------------
+def draw_screen(stdscr, state):
 
-        stdscr.addstr(
-            dialog_y,
-            dialog_x,
-            "┌"
-            + "─" * (dialog_w - 2)
-            + "┐",
-            curses.A_REVERSE,
+    stdscr.erase()
+    stdscr.border()
+
+    draw_menu_bar(stdscr, state["active_menu"])
+    draw_desktop_title(stdscr)
+    draw_desktop_icons(stdscr, state)
+    draw_trash(stdscr, state["trash_selected"])
+
+    for window in state["windows"]:
+        draw_window(stdscr, window, window is state["active_window"])
+
+    if state["active_menu"] is not None:
+        draw_popup_menu(
+            stdscr,
+            state["active_menu"],
+            dict(MENU_ITEMS)[state["active_menu"]],
         )
 
-        for y in range(
-            dialog_y + 1,
-            dialog_y + dialog_h - 1,
-        ):
+    draw_message(stdscr, state["message"])
 
-            stdscr.addstr(
-                y,
-                dialog_x,
-                "│",
-                curses.A_REVERSE,
-            )
+    draw_confirm_dialog(stdscr, state["dialog"])
+    draw_rename_dialog(stdscr, state["rename"])
+    draw_info_dialog(stdscr, state["info"])
 
-            stdscr.addstr(
-                y,
-                dialog_x + dialog_w - 1,
-                "│",
-                curses.A_REVERSE,
-            )
+    # ポインタは最後 (ダイアログの上でも見えるように)
+    draw_pointer(stdscr, state["mouse_x"], state["mouse_y"])
 
-        stdscr.addstr(
-            dialog_y + dialog_h - 1,
-            dialog_x,
-            "└"
-            + "─" * (dialog_w - 2)
-            + "┘",
-            curses.A_REVERSE,
-        )
-
-        # ----------------------------------------------------
-        # タイトル
-        # ----------------------------------------------------
-
-        title = "Get Info"
-
-        stdscr.addstr(
-            dialog_y + 1,
-            dialog_x + 2,
-            title,
-            curses.A_REVERSE,
-        )
-
-        # ----------------------------------------------------
-        # 情報
-        # ----------------------------------------------------
-
-        lines = (
-            "Name:     " + info.get("name", ""),
-            "Kind:     " + info.get("kind", ""),
-            "Location: " + info.get("location", ""),
-            "Size:     " + info.get("size", ""),
-            "Modified: " + info.get("modified", ""),
-        )
-
-        for i, line in enumerate(lines):
-
-            stdscr.addstr(
-                dialog_y + 3 + i,
-                dialog_x + 3,
-                line[:dialog_w - 6],
-                curses.A_REVERSE,
-            )
-
-        # ----------------------------------------------------
-        # 閉じる
-        # ----------------------------------------------------
-
-        close_text = "[ Enter / Esc ]"
-
-        close_x = (
-            dialog_x
-            + (
-                dialog_w
-                - len(close_text)
-            ) // 2
-        )
-
-        stdscr.addstr(
-            dialog_y + dialog_h - 2,
-            close_x,
-            close_text,
-            curses.A_REVERSE,
-        )
-
-    except curses.error:
-
-        pass
+    stdscr.refresh()

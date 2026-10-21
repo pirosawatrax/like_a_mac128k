@@ -1,30 +1,49 @@
 # ============================================================
 # events.py
-# Finderイベント処理
+# Finder イベント処理
+#
+# 構成:
+#   1. 共通ヘルパー      (選択・更新・Undo)
+#   2. ファイル操作      (移動・ゴミ箱・名前変更)
+#   3. メニュー動作      (MENU_ACTIONS に登録)
+#   4. ドラッグ処理
+#   5. マウス / キーボード入力
 # ============================================================
 
 import curses
-import time
 import os
 import shutil
 import sys
-import subprocess
-import shlex
+import time
 
 from constants import (
     DOUBLE_CLICK_TIME,
-    TRASH_PATH,
     HOME,
+    TRASH_PATH,
+    MAX_UNDO,
+)
+
+from filesystem import (
+    refresh_desktop_icons,
+    arrange_icons,
+    same_path,
+    is_inside,
+    unique_destination,
+    set_show_hidden,
+    show_hidden_enabled,
 )
 
 from menu import (
+    APPLE_SYMBOL,
+    MENU_ITEMS,
     menu_at,
     menu_item_at,
-    MENU_ITEMS,
 )
 
 from windows import (
     create_window,
+    refresh_window,
+    layout_window_icons,
     bring_to_front,
     close_window,
     window_at,
@@ -38,4357 +57,1360 @@ from windows import (
     scroll_window,
 )
 
-from filesystem import (
-    icon_at,
-    read_directory,
-    arrange_icons,
+from desktop import (
+    point_in_trash,
+    desktop_icon_at,
+    desktop_max_scroll,
+    confirm_layout,
+    DESKTOP_TOP,
 )
 
 from trash import (
     move_to_trash,
     restore_from_trash,
+    forget_trash_item,
     empty_trash,
+    invalidate_cache,
 )
 
+from launcher import (
+    request_launch,
+    launch_file,
+    edit_file,
+    run_external,
+)
+
+BTN_PRESS = curses.BUTTON1_PRESSED
+BTN_RELEASE = curses.BUTTON1_RELEASED
+WHEEL_UP = getattr(curses, "BUTTON4_PRESSED", 0)
+WHEEL_DOWN = getattr(curses, "BUTTON5_PRESSED", 0)
+
+ENTER_KEYS = (curses.KEY_ENTER, 10, 13)
+
 
 # ============================================================
-# ダブルクリック判定
+# 1. 共通ヘルパー
 # ============================================================
 
-def is_double_click(
-    state,
-    icon,
-):
+def say(state, text):
+    state["message"] = text
+
+
+def push_undo(state, entry):
+
+    state["undo"].append(entry)
+    del state["undo"][:-MAX_UNDO]
+
+
+def clear_selection(state):
+
+    state["desktop_selected"] = None
+    state["trash_selected"] = False
+
+    for window in state["windows"]:
+        window["selected"] = None
+
+
+def select_icon(state, icon, window=None):
+    """選択は常に 1 つだけ"""
+
+    clear_selection(state)
+
+    if window is None:
+        state["desktop_selected"] = icon
+    else:
+        window["selected"] = icon
+
+
+def current_selection(state):
+    """(選択中アイコン, そのウィンドウ or None)"""
+
+    window = state["active_window"]
+
+    if window is not None and window["selected"] is not None:
+        return window["selected"], window
+
+    if state["desktop_selected"] is not None:
+        return state["desktop_selected"], None
+
+    for window in reversed(state["windows"]):
+        if window["selected"] is not None:
+            return window["selected"], window
+
+    return None, None
+
+
+def is_double_click(state, key):
+    """key: アイコンのパスなど。作り直されても同一判定できる"""
 
     now = time.monotonic()
 
     if (
-        state["last_clicked"] is icon
-        and
-        now - state["last_click_time"]
-        < DOUBLE_CLICK_TIME
+        state["last_click_key"] == key
+        and now - state["last_click_time"] < DOUBLE_CLICK_TIME
     ):
-
-        state["last_clicked"] = None
-
+        state["last_click_key"] = None
         return True
 
-    state["last_clicked"] = icon
+    state["last_click_key"] = key
     state["last_click_time"] = now
-
     return False
 
 
-# ============================================================
-# Esc
-# ============================================================
+def update_mouse_position(state, width, height, x, y):
 
-def handle_escape(
-    state,
-):
-
-    if state["active_menu"] is not None:
-
-        state["active_menu"] = None
-
-        state["message"] = (
-            "Menu closed"
-        )
-
-        return
-
-    if state["windows"]:
-
-        state["dragging_window"] = None
-
-        state["resizing_window"] = None
-
-        state["windows"].pop()
-
-        state["active_window"] = (
-            get_active_window(
-                state["windows"]
-            )
-        )
-
-        state["message"] = (
-            "Window closed"
-        )
+    state["mouse_x"] = max(1, min(width - 2, x))
+    state["mouse_y"] = max(1, min(height - 2, y))
 
 
-# ============================================================
-# マウス位置更新
-# ============================================================
-
-def update_mouse_position(
-    state,
-    width,
-    height,
-    mouse_x,
-    mouse_y,
-):
-
-    state["mouse_x"] = max(
-        1,
-        min(
-            width - 2,
-            mouse_x,
-        ),
-    )
-
-    state["mouse_y"] = max(
-        1,
-        min(
-            height - 2,
-            mouse_y,
-        ),
-    )
-
-
-# ============================================================
-# Trash判定
-# ============================================================
-
-def point_in_trash(
-    width,
-    height,
-    mouse_x,
-    mouse_y,
-):
-
-    trash_x = width - 14
-    trash_y = height - 5
+def any_drag(state):
 
     return (
-        trash_y <= mouse_y <= trash_y + 1
-        and
-        trash_x <= mouse_x < trash_x + 12
+        state["drag"] is not None
+        or state["dragging_window"] is not None
+        or state["resizing_window"] is not None
     )
 
 
-# ============================================================
-# デスクトップアイコン移動開始
-# ============================================================
+def cancel_drags(state):
 
-def start_desktop_drag(
-    state,
-    icon,
-    mouse_x,
-    mouse_y,
-):
+    state["drag"] = None
+    state["dragging_window"] = None
+    state["resizing_window"] = None
 
-    state["desktop_dragging"] = icon
 
-    state["desktop_drag_offset_x"] = (
-        mouse_x
-        - icon["x"]
+def refresh_all(stdscr, state, select_path=None):
+    """ファイル操作の後に呼ぶ。デスクトップと全ウィンドウを読み直す"""
+
+    height, width = stdscr.getmaxyx()
+
+    selected = state["desktop_selected"]
+    selected_path = selected["path"] if selected else None
+
+    state["desktop_icons"] = refresh_desktop_icons(
+        state["desktop_icons"], width)
+
+    state["desktop_scroll"] = min(
+        state["desktop_scroll"],
+        desktop_max_scroll(state["desktop_icons"], height),
     )
 
-    state["desktop_drag_offset_y"] = (
-        mouse_y
-        - icon["y"]
-    )
+    state["desktop_selected"] = None
 
-    state["message"] = (
-        "Move: "
-        + icon["name"]
-    )
+    for icon in state["desktop_icons"]:
+        if icon["path"] == selected_path:
+            state["desktop_selected"] = icon
 
-# ============================================================
-# ファイルを起動
-# ============================================================
+    for window in list(state["windows"]):
 
-def launch_file(
-    state,
-    path,
-):
+        if os.path.isdir(window["path"]):
+            refresh_window(window)
+        else:
+            close_window(state["windows"], window)
 
-    if not os.path.isfile(path):
+    if state["active_window"] not in state["windows"]:
+        state["active_window"] = get_active_window(state["windows"])
 
-        state["message"] = (
-            "Not a file"
-        )
+    if select_path is not None:
 
-        return False
+        window = state["active_window"]
+        icons = window["icons"] if window else state["desktop_icons"]
 
-    name = os.path.basename(path)
+        for icon in icons:
+            if icon["path"] == select_path:
+                select_icon(state, icon, window)
+                break
 
-    # --------------------------------------------------------
-    # 画像
-    # --------------------------------------------------------
+    invalidate_cache()
 
-    if path.lower().endswith(
-        (".jpg", ".jpeg", ".png")
-    ):
 
-        image_path = shlex.quote(path)
+def update_window_paths(state, old_abs, new_abs):
+    """フォルダ名変更に合わせて、開いているウィンドウのパスを更新"""
 
-        shell_command = (
-            "chafa "
-            + image_path
-            + "; "
-            + "echo; "
-            + "echo 'Press Enter to close'; "
-            + "read"
-        )
+    for window in state["windows"]:
 
-        command = [
-            "tmux",
-            "new-window",
-            "bash",
-            "-c",
-            shell_command,
-        ]
+        path = os.path.abspath(window["path"])
 
-    # --------------------------------------------------------
-    # 動画
-    # --------------------------------------------------------
+        if path == old_abs:
+            window["path"] = new_abs
 
-    elif path.lower().endswith(
-        (".mp4", ".mkv", ".webm", ".avi")
-    ):
+        elif path.startswith(old_abs + os.sep):
+            window["path"] = os.path.join(
+                new_abs, os.path.relpath(path, old_abs))
 
-        video_script = os.path.expanduser(
-            "~/mac128k/chafa_video.sh"
-        )
 
-        command = [
-            "tmux",
-            "new-window",
-            video_script,
-            path,
-        ]
+def open_folder_window(stdscr, state, path):
 
-    # --------------------------------------------------------
-    # 音声
-    # --------------------------------------------------------
+    # すでに開いていれば前面へ
+    for window in state["windows"]:
+        if same_path(window["path"], path):
+            bring_to_front(state["windows"], window)
+            state["active_window"] = window
+            return window
 
-    elif path.lower().endswith(
-        (".wav", ".mp3", ".flac", ".ogg", ".m4a")
-    ):
+    height, width = stdscr.getmaxyx()
 
-        command = [
-            "tmux",
-            "new-window",
-            "mpv",
-            "--no-video",
-            path,
-        ]
+    window = create_window(
+        path, len(state["windows"]) + 1, width, height)
 
-    # --------------------------------------------------------
-    # Python
-    # --------------------------------------------------------
+    state["windows"].append(window)
+    state["active_window"] = window
 
-    elif path.lower().endswith(".py"):
+    return window
 
-        shell_command = (
-            "python3 "
-            + shlex.quote(path)
-            + "; "
-            + "status=$?; "
-            + "echo; "
-            + "echo '================================'; "
-            + "echo \"Python finished (exit code: $status)\"; "
-            + "echo '================================'; "
-            + "echo; "
-            + "echo 'Press Enter to close'; "
-            + "read"
-        )
 
-        command = [
-            "tmux",
-            "new-window",
-            "bash",
-            "-c",
-            shell_command,
-        ]
+def open_icon(stdscr, state, icon):
 
-    # --------------------------------------------------------
-    # テキスト
-    # --------------------------------------------------------
-
-    elif path.lower().endswith(
-        (".txt", ".md", ".ini", ".conf", ".cfg", ".log", ".csv")
-    ):
-
-        command = [
-            "tmux",
-            "new-window",
-            "nano",
-            path,
-        ]
-
-    # --------------------------------------------------------
-    # Shell script
-    # --------------------------------------------------------
-
-    elif path.lower().endswith(".sh"):
-
-        shell_command = (
-            "bash "
-            + shlex.quote(path)
-            + "; "
-            + "status=$?; "
-            + "echo; "
-            + "echo '================================'; "
-            + "echo \"Shell script finished (exit code: $status)\"; "
-            + "echo '================================'; "
-            + "echo; "
-            + "echo 'Press Enter to close'; "
-            + "read"
-        )
-
-        command = [
-            "tmux",
-            "new-window",
-            "bash",
-            "-c",
-            shell_command,
-        ]
-
-    # --------------------------------------------------------
-    # 実行ファイル
-    # --------------------------------------------------------
-
-    elif os.access(path, os.X_OK):
-
-        shell_command = (
-            shlex.quote(path)
-            + "; "
-            + "status=$?; "
-            + "echo; "
-            + "echo '================================'; "
-            + "echo \"Program finished (exit code: $status)\"; "
-            + "echo '================================'; "
-            + "echo; "
-            + "echo 'Press Enter to close'; "
-            + "read"
-        )
-
-        command = [
-            "tmux",
-            "new-window",
-            "bash",
-            "-c",
-            shell_command,
-        ]
-
+    if icon["type"] == "folder":
+        open_folder_window(stdscr, state, icon["path"])
+        say(state, "Opened: " + icon["name"])
     else:
+        request_launch(stdscr, state, icon["path"])
 
-        state["message"] = (
-            "Not executable: "
-            + name
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # 起動
-    # --------------------------------------------------------
-
-    try:
-
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-        state["message"] = (
-            "Launched: "
-            + name
-        )
-
-        return True
-
-    except OSError:
-
-        state["message"] = (
-            "Could not launch: "
-            + name
-        )
-
-        return False
-# ============================================================
-# テキストファイルをEditorで開く
-# ============================================================
-
-def edit_file(
-    state,
-    path,
-):
-
-    if not os.path.isfile(path):
-
-        state["message"] = (
-            "Not a file"
-        )
-
-        return False
-
-    name = os.path.basename(path)
-
-    # --------------------------------------------------------
-    # 編集可能な拡張子
-    # --------------------------------------------------------
-
-    editable_extensions = (
-        ".py",
-        ".sh",
-        ".txt",
-        ".md",
-        ".ini",
-        ".conf",
-        ".cfg",
-        ".log",
-        ".csv",
-        ".json",
-        ".xml",
-        ".html",
-        ".css",
-    )
-
-    if not path.lower().endswith(
-        editable_extensions
-    ):
-
-        state["message"] = (
-            "Cannot edit: "
-            + name
-        )
-
-        return False
-
-    # --------------------------------------------------------
-    # nano
-    # --------------------------------------------------------
-
-    command = [
-        "tmux",
-        "new-window",
-        "nano",
-        path,
-    ]
-
-    try:
-
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-
-        state["message"] = (
-            "Editing: "
-            + name
-        )
-
-        return True
-
-    except OSError:
-
-        state["message"] = (
-            "Could not edit: "
-            + name
-        )
-
-        return False
 
 # ============================================================
-# アイテムのドラッグ開始
+# 2. ファイル操作
 # ============================================================
 
-def start_item_drag(
-    state,
-    icon,
-    window,
-):
+def trash_item(stdscr, state, icon):
 
-    state["dragging_item"] = icon
-    state["dragging_item_window"] = window
+    name = icon["name"]
+    path = icon["path"]
 
-    state["message"] = (
-        "Move: "
-        + icon["name"]
-    )
-
-# ============================================================
-# ウィンドウ内アイコンのドラッグ開始
-# ============================================================
-
-def start_window_icon_drag(
-    state,
-    window,
-    icon,
-    mouse_x,
-    mouse_y,
-):
-   
-   
-    scroll = window.get("scroll", 0)
-
-    state["window_icon_dragging"] = {
-        "window": window,
-        "icon": icon,
-    }
-
-    state["window_icon_drag_offset_x"] = (
-        mouse_x
-        - window["x"]
-        - icon["x"]
-    )
-    
-   
-    
-    state["window_icon_drag_offset_y"] = (
-        mouse_y
-        - window["y"]
-        + scroll
-        - icon["y"]
-    )
-  
-# ============================================================
-# ウィンドウ内アイコンをドラッグ中
-# ============================================================
-
-def update_window_icon_drag(
-    state,
-):
-
-    drag = state["window_icon_dragging"]
-
-    if drag is None:
+    if same_path(os.path.dirname(path), TRASH_PATH):
+        say(state, "Already in Trash")
         return
 
-    window = drag["window"]
-    icon = drag["icon"]
+    trashed = move_to_trash(path)
 
-    mouse_x = state["mouse_x"]
-    mouse_y = state["mouse_y"]
+    if trashed is None:
+        say(state, "Could not move to Trash: " + name)
+        return
 
-    new_x = (
-        mouse_x
-        - window["x"]
-        - state["window_icon_drag_offset_x"]
-    )
-
-    scroll = window.get("scroll", 0)
-    
-    new_y = (
-        mouse_y
-        - window["y"]
-        + scroll
-        - state["window_icon_drag_offset_y"]
-    )
- 
-    # --------------------------------------------------------
-    # ウィンドウ内から外へ出ないようにする
-    # --------------------------------------------------------
-
-    min_x = 2
-    min_y = 2
-
-    max_x = window["w"] - 3
-
-    content_max_y = max(
-        item["y"]
-        for item in window["icons"]
-    )
-
-    max_y = content_max_y + 3
-
-    new_x = max(
-        min_x,
-        min(
-            new_x,
-            max_x,
-        ),
-    )
-
-    new_y = max(
-        min_y,
-        min(
-            new_y,
-            max_y,
-        ),
-    )
-
-    icon["x"] = new_x
-    icon["y"] = new_y
-
-  
-
-# ============================================================
-# ドロップ先フォルダを取得
-# ============================================================
+    push_undo(state, {"action": "trash", "name": trashed})
+    refresh_all(stdscr, state)
+    state["trash_selected"] = False
+    say(state, "Moved to Trash: " + name)
 
 
-def folder_at_drop_position(
-    state,
-    mouse_x,
-    mouse_y,
-):
+def move_item(stdscr, state, icon, dest_dir, quiet_same=False):
+    """icon を dest_dir へ移動する"""
 
-    # --------------------------------------------------------
-    # ウィンドウ上か確認
-    # --------------------------------------------------------
+    source = icon["path"]
+    name = os.path.basename(source)
+    source_dir = os.path.dirname(source)
 
-    window = window_at(
-        state["windows"],
-        mouse_x,
-        mouse_y,
-    )
+    # 自分自身の上に落とした (= ただのクリック)
+    if same_path(dest_dir, source):
+        return
 
-    # --------------------------------------------------------
-    # ウィンドウ上
-    # --------------------------------------------------------
+    if same_path(dest_dir, source_dir):
+        say(state, "Icon moved" if quiet_same else "Already here")
+        return
+
+    if is_inside(dest_dir, source):
+        say(state, "Cannot move a folder into itself")
+        return
+
+    destination = unique_destination(dest_dir, name)
+
+    try:
+        shutil.move(source, destination)
+    except (OSError, shutil.Error):
+        say(state, "Could not move: " + name)
+        return
+
+    if same_path(source_dir, TRASH_PATH):
+        forget_trash_item(name)
+    else:
+        push_undo(state, {
+            "action": "move",
+            "source": destination,
+            "destination": source,
+        })
+
+    refresh_all(stdscr, state)
+    say(state, "Moved: " + os.path.basename(destination))
+
+
+def drop_target(stdscr, state, x, y, dragged):
+    """('trash', None) か ('dir', path)"""
+
+    height, width = stdscr.getmaxyx()
+
+    window = window_at(state["windows"], x, y)
 
     if window is not None:
 
-        # --------------------------------------------
-        # フォルダの上なら、そのフォルダへ
-        # --------------------------------------------
+        if same_path(window["path"], TRASH_PATH):
+            return "trash", None
 
-        icon = window_icon_at(
-            window,
-            mouse_x,
-            mouse_y,
-        )
+        target = window_icon_at(window, x, y, exclude=dragged)
 
-        if (
-            icon is not None
-            and
-            icon["type"] == "folder"
-        ):
+        if target is not None and target["type"] == "folder":
+            return "dir", target["path"]
 
-            return icon["path"]
+        return "dir", window["path"]
 
-        # --------------------------------------------
-        # 空白部分なら、
-        # そのウィンドウが表示しているフォルダへ
-        # --------------------------------------------
+    if point_in_trash(width, height, x, y):
+        return "trash", None
 
-        return window["path"]
+    target = desktop_icon_at(state, x, y, height, exclude=dragged)
 
-    # --------------------------------------------------------
-    # デスクトップ上
-    # --------------------------------------------------------
+    if target is not None and target["type"] == "folder":
+        return "dir", target["path"]
 
-    icon = icon_at(
-        state["desktop_icons"],
-        mouse_x,
-        mouse_y,
-    )
+    return "dir", HOME
 
-    # --------------------------------------------------------
-    # デスクトップ上のフォルダ
-    # --------------------------------------------------------
+
+def commit_rename(stdscr, state):
+
+    rename = state["rename"]
+    new_name = rename["name"]
+
+    if new_name == rename["old_name"]:
+        state["rename"] = None
+        say(state, "Rename cancelled")
+        return
 
     if (
-        icon is not None
-        and
-        icon["type"] == "folder"
+        new_name == ""
+        or "/" in new_name
+        or "\0" in new_name
+        or new_name in (".", "..")
+        or len(new_name.encode("utf-8", "replace")) > 255
     ):
-
-        return icon["path"]
-
-    # --------------------------------------------------------
-    # デスクトップの空白
-    #
-    # → HOMEへ移動
-    # --------------------------------------------------------
-
-    return HOME
-
-
-
-# ============================================================
-# アイテムをフォルダへドロップ
-# ============================================================
-
-def drop_item_on_folder(
-    state,
-    width,
-    height,
-):
-
-    icon = state["dragging_item"]
-
-    if icon is None:
+        say(state, "Invalid name")
         return
 
-    mouse_x = state["mouse_x"]
-    mouse_y = state["mouse_y"]
+    old_path = rename["path"]
+    new_path = os.path.join(os.path.dirname(old_path), new_name)
 
-    destination_dir = folder_at_drop_position(
-        state,
-        mouse_x,
-        mouse_y,
-    )
-
-    if destination_dir is None:
-
-        state["message"] = (
-            "Move cancelled"
-        )
-
+    if os.path.lexists(new_path):
+        say(state, "Already exists")
         return
-
-    source = icon["path"]
-
-    source_dir = os.path.dirname(
-        source
-    )
-
-    # --------------------------------------------------------
-    # 同じフォルダへのドロップ
-    # --------------------------------------------------------
-
-    if os.path.abspath(
-        source_dir
-    ) == os.path.abspath(
-        destination_dir
-    ):
-
-        state["message"] = (
-            "Already here"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 移動先に同名ファイルがある場合
-    # --------------------------------------------------------
-
-    name = os.path.basename(
-        source
-    )
-
-    destination = os.path.join(
-        destination_dir,
-        name,
-    )
-
-    if os.path.exists(destination):
-
-        base, extension = os.path.splitext(
-            name
-        )
-
-        number = 2
-
-        while os.path.exists(
-            destination
-        ):
-
-            if extension:
-
-                new_name = (
-                    base
-                    + " copy "
-                    + str(number)
-                    + extension
-                )
-
-            else:
-
-                new_name = (
-                    base
-                    + " copy "
-                    + str(number)
-                )
-
-            destination = os.path.join(
-                destination_dir,
-                new_name,
-            )
-
-            number += 1
-
-    # --------------------------------------------------------
-    # 移動
-    # --------------------------------------------------------
 
     try:
-
-        shutil.move(
-            source,
-            destination,
-        )
-
+        os.rename(old_path, new_path)
     except OSError:
-
-        state["message"] = (
-            "Could not move: "
-            + name
-        )
-
+        say(state, "Could not rename")
         return
 
-    # --------------------------------------------------------
-    # Undo情報を保存
-    # --------------------------------------------------------
+    update_window_paths(
+        state, os.path.abspath(old_path), os.path.abspath(new_path))
 
-    state["undo"] = {
-        "action": "move",
-        "source": destination,
-        "destination": source,
-        "name": os.path.basename(destination),
+    push_undo(state, {
+        "action": "rename",
+        "source": new_path,
+        "destination": old_path,
+        "old_name": rename["old_name"],
+    })
+
+    state["rename"] = None
+    refresh_all(stdscr, state, select_path=new_path)
+    say(state, "Renamed: " + new_name)
+
+
+# ============================================================
+# 3. メニュー動作
+# ============================================================
+
+def act_about(stdscr, state):
+
+    state["info"] = {
+        "title": "About This Macintosh",
+        "lines": [
+            "like_a_mac128K TUI",
+            "A Macintosh Finder in a terminal",
+            "",
+            "Python " + sys.version.split()[0],
+            "ncurses " + ".".join(
+                str(n) for n in curses.ncurses_version[:3]),
+        ],
     }
-  
-    # --------------------------------------------------------
-    # デスクトップを更新
-    # --------------------------------------------------------
-
-    state["desktop_icons"] = (
-        read_directory(HOME)
-    )
-
-    print(
-        "DEBUG desktop_icons:",
-        len(state["desktop_icons"]),
-        file=sys.stderr
-    )
-    
-    state["message"] = (
-        "Desktop icons: "
-        + str(len(state["desktop_icons"]))
-    )
-    
-    arrange_icons(
-        state["desktop_icons"],
-        width,
-        height,
-    )
-
- 
 
 
-    state["desktop_selected"] = None
+def act_not_implemented(stdscr, state):
+    say(state, "Not implemented")
 
-    # --------------------------------------------------------
-    # 関係するウィンドウを更新
-    # --------------------------------------------------------
 
-    source_path = os.path.abspath(
-        source_dir
-    )
+def act_new_window(stdscr, state):
 
-    destination_path = os.path.abspath(
-        destination_dir
-    )
+    open_folder_window(stdscr, state, HOME)
+    say(state, "New Window")
 
-    for window in state["windows"]:
 
-        window_path = os.path.abspath(
-            window["path"]
-        )
+def act_new_folder(stdscr, state):
 
-        if (
-            window_path == source_path
-            or
-            window_path == destination_path
-        ):
+    window = state["active_window"]
+    target = window["path"] if window else HOME
 
-            window["icons"] = (
-                read_directory(
-                    window["path"]
-                )
-            )
-
-            window_w = window["w"]
-
-            columns = max(
-                1,
-                (window_w - 4) // 18
-            )
-
-            for i, item in enumerate(
-                window["icons"]
-            ):
-
-                column = i % columns
-                row = i // columns
-
-                item["x"] = (
-                    2
-                    + column * 18
-                )
-
-                item["y"] = (
-                    2
-                    + row * 3
-                )
-
-            window["selected"] = None
-
-    state["message"] = (
-        "Moved: "
-        + os.path.basename(destination)
-    )
-
-# ============================================================
-# デスクトップアイコン移動中
-# ============================================================
-
-def update_desktop_drag(
-    state,
-    width,
-    height,
-):
-
-    icon = state["desktop_dragging"]
-
-    if icon is None:
+    if same_path(target, TRASH_PATH):
+        say(state, "Cannot create items in Trash")
         return
 
-    new_x = (
-        state["mouse_x"]
-        - state["desktop_drag_offset_x"]
-    )
+    name = "New Folder"
+    path = os.path.join(target, name)
+    number = 2
 
-    new_y = (
-        state["mouse_y"]
-        - state["desktop_drag_offset_y"]
-    )
-
-    # --------------------------------------------------------
-    # 画面外へ出ないようにする
-    # --------------------------------------------------------
-
-    new_x = max(
-        1,
-        min(
-            width - 8,
-            new_x,
-        ),
-    )
-
-    new_y = max(
-        3,
-        min(
-            height - 4,
-            new_y,
-        ),
-    )
-
-    icon["x"] = new_x
-    icon["y"] = new_y
-
-
-# ============================================================
-# デスクトップアイコンをドロップ
-# ============================================================
-
-def drop_desktop_icon(
-    state,
-    width,
-    height,
-):
-
-    icon = state["desktop_dragging"]
-
-    if icon is None:
-        return
-
-    mouse_x = state["mouse_x"]
-    mouse_y = state["mouse_y"]
-
-    # --------------------------------------------------------
-    # Trashへのドロップ
-    # --------------------------------------------------------
-
-    if point_in_trash(
-        width,
-        height,
-        mouse_x,
-        mouse_y,
-    ):
-
-        name = icon["name"]
-        path = icon["path"]
-
-        if move_to_trash(path):
-            
-            # ------------------------------------------------
-            # Undo情報を保存
-            # ------------------------------------------------
-
-            state["undo"] = {
-                "action": "move_to_trash",
-                "source": path,
-                "name": name,
-            }
-            
-            if icon in state["desktop_icons"]:
-
-                state["desktop_icons"].remove(
-                    icon
-                )
-
-            if state["desktop_selected"] is icon:
-
-                state["desktop_selected"] = None
-
-            state["trash_selected"] = False
-
-            state["message"] = (
-                "Moved to Trash: "
-                + name
-            )
-
-        else:
-
-            state["message"] = (
-                "Could not move to Trash: "
-                + name
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # フォルダへのドロップ
-    # --------------------------------------------------------
-
-    destination_dir = folder_at_drop_position(
-        state,
-        mouse_x,
-        mouse_y,
-    )
-
-    # フォルダではない場所なら
-    # デスクトップ上でアイコンを動かしただけ
-    if destination_dir is None:
-
-        state["message"] = (
-            "Desktop icon moved"
-        )
-
-        return
-
-    source = icon["path"]
-
-    source_dir = os.path.dirname(
-        source
-    )
-
-    # --------------------------------------------------------
-    # 同じフォルダへのドロップ
-    # --------------------------------------------------------
-
-    if os.path.abspath(
-        source_dir
-    ) == os.path.abspath(
-        destination_dir
-    ):
-
-        state["message"] = (
-            "Already here"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # 移動先のファイル名
-    # --------------------------------------------------------
-
-    name = os.path.basename(
-        source
-    )
-
-    destination = os.path.join(
-        destination_dir,
-        name,
-    )
-
-    if os.path.exists(destination):
-
-        base, extension = os.path.splitext(
-            name
-        )
-
-        number = 2
-
-        while os.path.exists(
-            destination
-        ):
-
-            if extension:
-
-                new_name = (
-                    base
-                    + " copy "
-                    + str(number)
-                    + extension
-                )
-
-            else:
-
-                new_name = (
-                    base
-                    + " copy "
-                    + str(number)
-                )
-
-            destination = os.path.join(
-                destination_dir,
-                new_name,
-            )
-
-            number += 1
-
-    # --------------------------------------------------------
-    # 移動
-    # --------------------------------------------------------
+    while os.path.lexists(path):
+        name = "New Folder {}".format(number)
+        path = os.path.join(target, name)
+        number += 1
 
     try:
-
-        shutil.move(
-            source,
-            destination,
-        )
-
+        os.mkdir(path)
     except OSError:
-
-        state["message"] = (
-            "Could not move: "
-            + name
-        )
-
-        return
-    # --------------------------------------------------------
-    # Undo情報を保存
-    # --------------------------------------------------------
-
-    state["undo"] = {
-        "action": "move",
-        "source": destination,
-        "destination": source,
-        "name": os.path.basename(destination),
-    }
-    # --------------------------------------------------------
-    # デスクトップ更新
-    # --------------------------------------------------------
-
-    state["desktop_icons"] = (
-        read_directory(HOME)
-    )
-
-    arrange_icons(
-        state["desktop_icons"],
-        width,
-        height,
-    )
-
-    state["desktop_selected"] = None
-
-    # --------------------------------------------------------
-    # 移動先が開いているウィンドウなら更新
-    # --------------------------------------------------------
-
-    destination_path = os.path.abspath(
-        destination_dir
-    )
-
-    for window in state["windows"]:
-
-        window_path = os.path.abspath(
-            window["path"]
-        )
-
-        if window_path == destination_path:
-
-            window["icons"] = (
-                read_directory(
-                    window["path"]
-                )
-            )
-
-            window_w = window["w"]
-
-            columns = max(
-                1,
-                (window_w - 4) // 18
-            )
-
-            for i, item in enumerate(
-                window["icons"]
-            ):
-
-                column = i % columns
-                row = i // columns
-
-                item["x"] = (
-                    2
-                    + column * 18
-                )
-
-                item["y"] = (
-                    2
-                    + row * 3
-                )
-
-            window["selected"] = None
-
-    state["message"] = (
-        "Moved: "
-        + os.path.basename(destination)
-    )
-
-
-# ============================================================
-# ウィンドウ移動開始
-# ============================================================
-
-def start_window_drag(
-    state,
-    window,
-    mouse_x,
-    mouse_y,
-):
-
-    state["dragging_window"] = window
-
-    state["window_drag_offset_x"] = (
-        mouse_x
-        - window["x"]
-    )
-
-    state["window_drag_offset_y"] = (
-        mouse_y
-        - window["y"]
-    )
-
-    state["message"] = (
-        "Move window: "
-        + window["path"]
-    )
-
-
-# ============================================================
-# ウィンドウ移動中
-# ============================================================
-
-def update_window_drag(
-    state,
-    width,
-    height,
-):
-
-    window = state["dragging_window"]
-
-    if window is None:
+        say(state, "Could not create folder")
         return
 
-    new_x = (
-        state["mouse_x"]
-        - state["window_drag_offset_x"]
-    )
-
-    new_y = (
-        state["mouse_y"]
-        - state["window_drag_offset_y"]
-    )
-
-    new_x = max(
-        1,
-        min(
-            width
-            - window["w"]
-            - 1,
-            new_x,
-        ),
-    )
-
-    new_y = max(
-        3,
-        min(
-            height
-            - window["h"]
-            - 1,
-            new_y,
-        ),
-    )
-
-    window["x"] = new_x
-    window["y"] = new_y
+    refresh_all(stdscr, state, select_path=path)
+    say(state, "Created " + name)
 
 
-# ============================================================
-# ウィンドウリサイズ開始
-# ============================================================
+def act_open(stdscr, state):
 
-def start_resize(
-    state,
-    window,
-):
-
-    state["resizing_window"] = window
-
-    state["message"] = (
-        "Resize window"
-    )
-
-
-# ============================================================
-# ウィンドウリサイズ中
-# ============================================================
-
-def update_resize(
-    state,
-    width,
-    height,
-):
-
-    window = state["resizing_window"]
-
-    if window is None:
-        return
-
-    new_w = (
-        state["mouse_x"]
-        - window["x"]
-        + 1
-    )
-
-    new_h = (
-        state["mouse_y"]
-        - window["y"]
-        + 1
-    )
-
-    new_w = max(
-        20,
-        new_w,
-    )
-
-    new_h = max(
-        7,
-        new_h,
-    )
-
-    new_w = min(
-        new_w,
-        width
-        - window["x"]
-        - 1,
-    )
-
-    new_h = min(
-        new_h,
-        height
-        - window["y"]
-        - 1,
-    )
-
-    window["w"] = new_w
-    window["h"] = new_h
-
-
-def handle_window_click(
-
-    state,
-    window,
-    mouse_x,
-    mouse_y,
-    width,
-    height,
-):
-   
-    
-    bring_to_front(
-        state["windows"],
-        window,
-    )
-
-    state["active_window"] = (
-        get_active_window(
-            state["windows"]
-        )
-    )
-
-    if point_on_close_button(
-        window,
-        mouse_x,
-        mouse_y,
-    ):
-
-        name = window_title(window)
-
-        close_window(
-            state["windows"],
-            window,
-        )
-
-        state["active_window"] = (
-            get_active_window(
-                state["windows"]
-            )
-        )
-
-        state["message"] = (
-            "Closed: "
-            + name
-        )
-
-        return
-
-    if point_on_resize_handle(
-        window,
-        mouse_x,
-        mouse_y,
-    ):
-
-        start_resize(
-            state,
-            window,
-        )
-
-        return
-
-    if point_in_titlebar(
-        window,
-        mouse_x,
-        mouse_y,
-    ):
-
-        start_window_drag(
-            state,
-            window,
-            mouse_x,
-            mouse_y,
-        )
-
-        return
-
-    icon = window_icon_at(
-        window,
-        mouse_x,
-        mouse_y,
-    )
+    icon, window = current_selection(state)
 
     if icon is None:
+        say(state, "No item selected")
         return
 
-    window["selected"] = icon
+    open_icon(stdscr, state, icon)
 
-    state["message"] = (
-        "Selected: "
-        + icon["name"]
-    )
 
-    # --------------------------------------------------------
-    # ダブルクリック判定
-    # --------------------------------------------------------
+def act_open_in_editor(stdscr, state):
 
-    double_click = is_double_click(
-        state,
-        icon,
-    )
+    icon, window = current_selection(state)
 
-   
-   
-    if double_click:
-
-        state["window_icon_press"] = None
-
-   
+    if icon is None:
+        say(state, "No item selected")
+    elif icon["type"] == "folder":
+        say(state, "Cannot edit folder")
     else:
-        start_window_icon_drag(
-            state,
-            window,
-            icon,
-            mouse_x,
-            mouse_y,
-        )
-        
-        return     
+        edit_file(stdscr, state, icon["path"])
 
 
-    # --------------------------------------------------------
-    # Trash の中身を元の場所へ戻す
-    # --------------------------------------------------------
-
-    if window["path"] == TRASH_PATH:
-
-        name = icon["name"]
-
-        if restore_from_trash(name):
-
-            # ------------------------------------------------
-            # Trashウィンドウを更新
-            # ------------------------------------------------
-
-            window["icons"] = read_directory(
-                TRASH_PATH
-            )
-
-            window["selected"] = None
-
-            # ------------------------------------------------
-            # デスクトップも更新
-            # ------------------------------------------------
-
-            state["desktop_icons"] = read_directory(
-                HOME
-            )
-
-            # ------------------------------------------------
-            # デスクトップアイコン位置を再配置
-            # ------------------------------------------------
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            state["message"] = (
-                "Put Back: "
-                + name
-            )
-
-        else:
-
-            state["message"] = (
-                "Could not Put Back: "
-                + name
-            )
-
-        return
-
-    # --------------------------------------------------------
-    # ファイル
-    # --------------------------------------------------------
-
-    if icon["type"] == "file":
-
-        launch_file(
-            state,
-            icon["path"],
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # フォルダ以外
-    # --------------------------------------------------------
-
-    if icon["type"] != "folder":
-        return
-
-    # --------------------------------------------------------
-    # フォルダを開く
-    # --------------------------------------------------------
-
-    new_window = create_window(
-        icon["path"],
-        len(
-            state["windows"]
-        ) + 1,
-        width,
-        height,
-    )
-
-    state["windows"].append(
-        new_window
-    )
-
-    state["active_window"] = (
-        new_window
-    )
-
-    state["message"] = (
-        "Opened: "
-        + icon["name"]
-    )
+KIND_MAP = {
+    ".py": "Python Source", ".sh": "Shell Script",
+    ".txt": "Text Document", ".md": "Markdown Document",
+    ".jpg": "JPEG Image", ".jpeg": "JPEG Image", ".png": "PNG Image",
+    ".wav": "WAV Audio", ".mp3": "MP3 Audio", ".flac": "FLAC Audio",
+    ".ogg": "OGG Audio", ".m4a": "M4A Audio",
+    ".mp4": "MP4 Video", ".mkv": "MKV Video",
+    ".webm": "WebM Video", ".avi": "AVI Video",
+}
 
 
-# ============================================================
-# デスクトップクリック
-# ============================================================
+def human_size(size):
 
-def handle_desktop_click(
-    state,
-    mouse_x,
-    mouse_y,
-    width,
-    height,
-):
+    if size < 1024:
+        return "{} bytes".format(size)
 
-    icon = icon_at(
-        state["desktop_icons"],
-        mouse_x,
-        mouse_y,
-    )
+    for unit in ("KB", "MB", "GB"):
+        size /= 1024.0
+        if size < 1024 or unit == "GB":
+            return "{:.1f} {}".format(size, unit)
+
+
+def act_get_info(stdscr, state):
+
+    icon, window = current_selection(state)
 
     if icon is None:
+        say(state, "No item selected")
         return
 
-    state["desktop_selected"] = icon
+    path = icon["path"]
+    name = os.path.basename(path)
 
-    state["message"] = (
-        "Selected: "
-        + icon["name"]
-    )
+    if os.path.isdir(path):
+        kind = "Folder"
+    else:
+        kind = KIND_MAP.get(os.path.splitext(name)[1].lower(), "File")
 
-    # --------------------------------------------------------
-    # ダブルクリック
-    # --------------------------------------------------------
+    try:
+        st = os.stat(path)
+        size = "--" if os.path.isdir(path) else human_size(st.st_size)
+        modified = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+    except OSError:
+        size = "Unknown"
+        modified = "Unknown"
 
-    if is_double_click(
-        state,
-        icon,
+    state["info"] = {
+        "title": "Get Info",
+        "lines": [
+            "Name:     " + icon["label"],
+            "Kind:     " + kind,
+            "Location: " + os.path.dirname(path),
+            "Size:     " + size,
+            "Modified: " + modified,
+        ],
+    }
+
+    say(state, "Get Info: " + name)
+
+
+def act_put_back(stdscr, state):
+
+    icon, window = current_selection(state)
+
+    if (
+        icon is None
+        or not same_path(os.path.dirname(icon["path"]), TRASH_PATH)
     ):
+        say(state, "Select an item in the Trash")
+        return
 
-        # ----------------------------------------------------
-        # フォルダ
-        # ----------------------------------------------------
+    destination = restore_from_trash(icon["name"])
 
-        if icon["type"] == "folder":
+    if destination is None:
+        say(state, "Could not Put Back: " + icon["name"])
+        return
 
-            new_window = create_window(
-                icon["path"],
-                len(
-                    state["windows"]
-                ) + 1,
-                width,
-                height,
-            )
-
-            state["windows"].append(
-                new_window
-            )
-
-            state["active_window"] = (
-                new_window
-            )
-
-            state["message"] = (
-                "Opened: "
-                + icon["name"]
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 実行ファイル
-        # ----------------------------------------------------
-
-        if icon["type"] == "file":
-
-            launch_file(
-                state,
-                icon["path"],
-            )
-
-            return
-
-    # --------------------------------------------------------
-    # ドラッグ開始
-    # --------------------------------------------------------
-
-    start_desktop_drag(
-        state,
-        icon,
-        mouse_x,
-        mouse_y,
-    )
+    refresh_all(stdscr, state)
+    say(state, "Put Back: " + icon["name"])
 
 
-# ============================================================
-# メニュークリック
-# ============================================================
+def act_close(stdscr, state):
 
-def handle_menu_click(
-    state,
-    mouse_x,
-    mouse_y,
-    width, 
-    height,
-):
+    window = state["active_window"]
 
-    # --------------------------------------------------------
-    # メニューバーをクリック
-    # --------------------------------------------------------
+    if window is None:
+        say(state, "No window to close")
+        return
 
-    clicked_menu = menu_at(
-        mouse_x,
-        mouse_y,
-    )
+    close_window(state["windows"], window)
+    state["active_window"] = get_active_window(state["windows"])
+    say(state, "Window closed")
 
-    if clicked_menu is not None:
 
-        state["active_menu"] = (
-            clicked_menu
-        )
+def ask(state, message, action, **extra):
 
-        return True
+    state["dialog"] = dict(
+        {"type": "confirm", "message": message, "action": action}, **extra)
 
-    # --------------------------------------------------------
-    # ポップアップメニューが開いている場合
-    # --------------------------------------------------------
 
-    if state["active_menu"] is not None:
+def act_quit(stdscr, state):
+    ask(state, "Quit Macintosh TUI?", "quit")
 
-        menu_name = state["active_menu"]
 
-        item = menu_item_at(
-            menu_name,
-            dict(MENU_ITEMS)[menu_name],
-            mouse_x,
-            mouse_y,
-        )
+def act_undo(stdscr, state):
 
-        
-        # ----------------------------------------------------
-        # File → Close
-        # ----------------------------------------------------
+    if not state["undo"]:
+        say(state, "Nothing to undo")
+        return
 
-        if (
-            menu_name == "File"
-            and
-            item == "Close"
-        ):
+    entry = state["undo"].pop()
+    kind = entry["action"]
+    ok = False
 
-            target_window = state["active_window"]
+    try:
 
-            if target_window is not None:
+        if kind == "trash":
+            ok = restore_from_trash(entry["name"]) is not None
 
-                if close_window(
-                    state["windows"],
-                    target_window,
-                ):
+        elif kind == "move":
 
-                    state["active_window"] = (
-                        get_active_window(
-                            state["windows"]
-                        )
-                    )
+            source = entry["source"]
+            destination = entry["destination"]
 
-                    state["message"] = (
-                        "Window closed"
-                    )
+            if os.path.lexists(source):
 
-            else:
+                directory = os.path.dirname(destination)
+                os.makedirs(directory, exist_ok=True)
 
-                state["message"] = (
-                    "No window to close"
+                shutil.move(
+                    source,
+                    unique_destination(
+                        directory, os.path.basename(destination)),
                 )
+                ok = True
 
-            state["active_menu"] = None
+        elif kind == "rename":
 
-            return True
-        
-        # ----------------------------------------------------
-        # File → New Window
-        # ----------------------------------------------------
+            source = entry["source"]
+            destination = entry["destination"]
 
-        if (
-            menu_name == "File"
-            and
-            item == "New Window"
-        ):
+            if os.path.lexists(source) and not os.path.lexists(destination):
 
-            new_window = create_window(
-                HOME,
-                len(
-                    state["windows"]
-                ) + 1,
-                width,
-                height,
-            )
+                os.rename(source, destination)
 
-            state["windows"].append(
-                new_window
-            )
-
-            state["active_window"] = (
-                new_window
-            )
-
-            state["message"] = (
-                "New Window"
-            )
-
-            state["active_menu"] = None
-
-            return True
-        # ----------------------------------------------------
-        # File → New Folder
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "File"
-            and
-            item == "New Folder"
-        ):
-
-            # ------------------------------------------------
-            # 作成場所を決める
-            # ------------------------------------------------
-
-            if state["active_window"] is not None:
-
-                target_dir = (
-                    state["active_window"]["path"]
-                )
-
-            else:
-
-                target_dir = HOME
-
-            # ------------------------------------------------
-            # フォルダ名を決める
-            # ------------------------------------------------
-
-            folder_name = "New Folder"
-
-            new_path = os.path.join(
-                target_dir,
-                folder_name,
-            )
-
-            number = 2
-
-            while os.path.exists(
-                new_path
-            ):
-
-                folder_name = (
-                    "New Folder "
-                    + str(number)
-                )
-
-                new_path = os.path.join(
-                    target_dir,
-                    folder_name,
-                )
-
-                number += 1
-
-            # ------------------------------------------------
-            # フォルダ作成
-            # ------------------------------------------------
-
-            try:
-
-                os.mkdir(
-                    new_path
-                )
-
-                # --------------------------------------------
-                # Desktopの場合
-                # --------------------------------------------
-
-                if (
-                    state["active_window"]
-                    is None
-                ):
-
-                    state["desktop_icons"] = (
-                        read_directory(HOME)
-                    )
-
-                    arrange_icons(
-                        state["desktop_icons"],
-                        width,
-                        height,
-                    )
-
-                    state["desktop_selected"] = None
-
-                    # 作成したフォルダを選択
-                    for icon in state["desktop_icons"]:
-
-                        if icon["path"] == new_path:
-
-                            state["desktop_selected"] = (
-                                icon
-                            )
-
-                            break
-
-                # --------------------------------------------
-                # Windowの場合
-                # --------------------------------------------
-
-                else:
-
-                    window = (
-                        state["active_window"]
-                    )
-
-                    window["icons"] = (
-                        read_directory(
-                            window["path"]
-                        )
-                    )
-
-                    window_w = window["w"]
-
-                    columns = max(
-                        1,
-                        (window_w - 4) // 18
-                    )
-
-                    for i, icon in enumerate(
-                        window["icons"]
-                    ):
-
-                        column = i % columns
-                        row = i // columns
-
-                        icon["x"] = (
-                            2
-                            + column * 18
-                        )
-
-                        icon["y"] = (
-                            2
-                            + row * 3
-                        )
-
-                    window["selected"] = None
-
-                    # 作成したフォルダを選択
-                    for icon in window["icons"]:
-
-                        if icon["path"] == new_path:
-
-                            window["selected"] = (
-                                icon
-                            )
-
-                            break
-
-                state["message"] = (
-                    "Created "
-                    + folder_name
-                )
-
-            except OSError:
-
-                state["message"] = (
-                    "Could not create folder"
-                )
-
-            state["active_menu"] = None
-
-            return True
-        # ----------------------------------------------------
-        # File → Open in Editor
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "File"
-            and
-            item == "Open in Editor"
-        ):
-
-            selected_icon = None
-
-            # ------------------------------------------------
-            # Desktopの選択
-            # ------------------------------------------------
-
-            if (
-                state["desktop_selected"]
-                is not None
-            ):
-
-                selected_icon = (
-                    state["desktop_selected"]
-                )
-
-            # ------------------------------------------------
-            # Window内の選択
-            # ------------------------------------------------
-
-            else:
-
-                for window in state["windows"]:
-
-                    if window["selected"] is not None:
-
-                        selected_icon = (
-                            window["selected"]
-                        )
-
-                        break
-
-            # ------------------------------------------------
-            # 選択なし
-            # ------------------------------------------------
-
-            if selected_icon is None:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-            # ------------------------------------------------
-            # フォルダ
-            # ------------------------------------------------
-
-            elif selected_icon["type"] == "folder":
-
-                state["message"] = (
-                    "Cannot edit folder"
-                )
-
-            # ------------------------------------------------
-            # ファイル
-            # ------------------------------------------------
-
-            else:
-
-                edit_file(
+                update_window_paths(
                     state,
-                    selected_icon["path"],
+                    os.path.abspath(source),
+                    os.path.abspath(destination),
                 )
+                ok = True
 
-            state["active_menu"] = None
+        elif kind == "copy":
+            # コピーの取り消し = コピーをゴミ箱へ (完全削除はしない)
+            ok = move_to_trash(entry["path"]) is not None
 
-            return True
-        # ----------------------------------------------------
-        # File → Get Info
-        # ----------------------------------------------------
+    except (OSError, shutil.Error):
+        ok = False
 
-        if (
-            menu_name == "File"
-            and
-            item == "Get Info"
-        ):
+    if ok:
+        refresh_all(stdscr, state)
+        say(state, "Undo: " + kind)
+    else:
+        say(state, "Could not undo")
 
-            selected_icon = None
 
-            # ------------------------------------------------
-            # Desktopの選択
-            # ------------------------------------------------
+def _copy_or_cut(state, action):
 
-            if (
-                state["desktop_selected"]
-                is not None
-            ):
+    icon, window = current_selection(state)
 
-                selected_icon = (
-                    state["desktop_selected"]
-                )
+    if icon is None:
+        say(state, "No item selected")
+        return
 
-            # ------------------------------------------------
-            # Window内の選択
-            # ------------------------------------------------
+    state["clipboard"] = {"path": icon["path"], "action": action}
+    say(state, ("Cut " if action == "cut" else "Copied ") + icon["name"])
 
+
+def act_cut(stdscr, state):
+    _copy_or_cut(state, "cut")
+
+
+def act_copy(stdscr, state):
+    _copy_or_cut(state, "copy")
+
+
+def act_paste(stdscr, state):
+
+    clip = state["clipboard"]
+
+    if clip is None:
+        say(state, "Nothing to paste")
+        return
+
+    source = clip["path"]
+
+    if not os.path.lexists(source):
+        state["clipboard"] = None
+        say(state, "Source no longer exists")
+        return
+
+    window = state["active_window"]
+    dest_dir = window["path"] if window else HOME
+
+    if same_path(dest_dir, TRASH_PATH):
+        say(state, "Cannot paste into Trash")
+        return
+
+    if same_path(dest_dir, source) or is_inside(dest_dir, source):
+        say(state, "Cannot paste a folder into itself")
+        return
+
+    name = os.path.basename(source)
+    source_dir = os.path.dirname(source)
+
+    try:
+
+        if clip["action"] == "cut":
+
+            if same_path(source_dir, dest_dir):
+                say(state, "Already here")
+                return
+
+            destination = unique_destination(dest_dir, name)
+            shutil.move(source, destination)
+
+            if same_path(source_dir, TRASH_PATH):
+                forget_trash_item(name)
             else:
-
-                for window in state["windows"]:
-
-                    if window["selected"] is not None:
-
-                        selected_icon = (
-                            window["selected"]
-                        )
-
-                        break
-
-            # ------------------------------------------------
-            # 選択なし
-            # ------------------------------------------------
-
-            if selected_icon is None:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            # ------------------------------------------------
-            # 情報を取得
-            # ------------------------------------------------
-
-            path = selected_icon["path"]
-
-            name = os.path.basename(path)
-
-            # ------------------------------------------------
-            # 種類
-            # ------------------------------------------------
-
-            if os.path.isdir(path):
-
-                kind = "Folder"
-
-            else:
-
-                extension = (
-                    os.path.splitext(name)[1].lower()
-                )
-
-                kind_map = {
-                    ".py": "Python Source",
-                    ".sh": "Shell Script",
-                    ".txt": "Text Document",
-                    ".md": "Markdown Document",
-                    ".jpg": "JPEG Image",
-                    ".jpeg": "JPEG Image",
-                    ".png": "PNG Image",
-                    ".wav": "WAV Audio",
-                    ".mp3": "MP3 Audio",
-                    ".flac": "FLAC Audio",
-                    ".ogg": "OGG Audio",
-                    ".m4a": "M4A Audio",
-                    ".mp4": "MP4 Video",
-                    ".mkv": "MKV Video",
-                    ".webm": "WebM Video",
-                    ".avi": "AVI Video",
-                }
-
-                kind = kind_map.get(
-                    extension,
-                    "File",
-                )
-
-            # ------------------------------------------------
-            # サイズ
-            # ------------------------------------------------
-
-            try:
-
-                size = os.path.getsize(path)
-
-                if size < 1024:
-
-                    size_text = (
-                        str(size)
-                        + " bytes"
-                    )
-
-                elif size < 1024 * 1024:
-
-                    size_text = (
-                        "{:.1f} KB".format(
-                            size / 1024
-                        )
-                    )
-
-                elif size < 1024 * 1024 * 1024:
-
-                    size_text = (
-                        "{:.1f} MB".format(
-                            size / (1024 * 1024)
-                        )
-                    )
-
-                else:
-
-                    size_text = (
-                        "{:.1f} GB".format(
-                            size / (1024 * 1024 * 1024)
-                        )
-                    )
-
-            except OSError:
-
-                size_text = "Unknown"
-
-            # ------------------------------------------------
-            # 更新日時
-            # ------------------------------------------------
-
-            try:
-
-                mtime = os.path.getmtime(path)
-
-                modified = time.strftime(
-                    "%Y-%m-%d %H:%M:%S",
-                    time.localtime(mtime),
-                )
-
-            except OSError:
-
-                modified = "Unknown"
-
-            # ------------------------------------------------
-            # Get Info状態
-            # ------------------------------------------------
-
-            state["info"] = {
-                "name": name,
-                "kind": kind,
-                "location": os.path.dirname(path),
-                "size": size_text,
-                "modified": modified,
-            }
-
-            state["message"] = (
-                "Get Info: "
-                + name
-            )
-
-            state["active_menu"] = None
-
-            return True
-
-
-        # ----------------------------------------------------
-        # File → Open
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "File"
-            and
-            item == "Open"
-        ):
-
-            selected_icon = (
-                state["desktop_selected"]
-            )
-
-            # ------------------------------------------------
-            # 選択されているアイコンがある
-            # ------------------------------------------------
-
-            if selected_icon is not None:
-
-                # --------------------------------------------
-                # フォルダなら開く
-                # --------------------------------------------
-
-                if selected_icon["type"] == "folder":
-
-                    new_window = create_window(
-                        selected_icon["path"],
-                        len(
-                            state["windows"]
-                        ) + 1,
-                        width,
-                        height,
-                    )
-
-                    state["windows"].append(
-                        new_window
-                    )
-
-                    state["active_window"] = (
-                        new_window
-                    )
-
-                    state["message"] = (
-                        "Opened "
-                        + selected_icon["name"]
-                    )
-
-                # --------------------------------------------
-                # ファイルなら起動
-                # --------------------------------------------
-
-                else:
-
-                    launch_file(
-                        state,
-                        selected_icon["path"]
-                )
-                
-            else:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # File → Quit
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "File"
-            and
-            item == "Quit"
-        ):
-
-            state["active_menu"] = None
-
-            state["message"] = (
-                "Goodbye"
-            )
-
-            state["running"] = False
-
-            return True
-
-        # ----------------------------------------------------
-        # Edit → Copy
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Copy"
-        ):
-
-            selected_icon = None
-
-            # -----------------------------------------------
-            # ウィンドウ内の選択
-            # -----------------------------------------------
-
-            active_window = state.get(
-                "active_window"
-            )
-
-            if active_window is not None:
-
-                selected_icon = (
-                    active_window.get("selected")
-                )
-
-            # -----------------------------------------------
-            # ウィンドウに選択がなければ
-            # デスクトップの選択を見る
-            # -----------------------------------------------
-
-            if selected_icon is None:
-
-                selected_icon = (
-                    state["desktop_selected"]
-                )
-
-            # -----------------------------------------------
-            # Copy
-            # -----------------------------------------------
-
-            if selected_icon is not None:
-
-                state["clipboard"] = {
-                    "icon": selected_icon,
-                    "action": "copy",
-                }
-
-                state["message"] = (
-                    "Copied "
-                    + selected_icon["name"]
-                )
-
-            else:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # Edit → Cut
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Cut"
-        ):
-
-            selected_icon = None
-
-            # -----------------------------------------------
-            # ウィンドウ内の選択
-            # -----------------------------------------------
-
-            active_window = state.get(
-                "active_window"
-            )
-
-            if active_window is not None:
-
-                selected_icon = (
-                    active_window.get("selected")
-                )
-
-            # -----------------------------------------------
-            # ウィンドウに選択がなければ
-            # デスクトップの選択を見る
-            # -----------------------------------------------
-
-            if selected_icon is None:
-
-                selected_icon = (
-                    state["desktop_selected"]
-                )
-
-            # -----------------------------------------------
-            # Cut
-            # -----------------------------------------------
-
-            if selected_icon is not None:
-
-                state["clipboard"] = {
-                    "icon": selected_icon,
-                    "action": "cut",
-                }
-
-                state["message"] = (
-                    "Cut "
-                    + selected_icon["name"]
-                )
-
-            else:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-            state["active_menu"] = None
-
-            return True
-
-
-        # ----------------------------------------------------
-        # Edit → Clear
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Clear"
-        ):
-
-            selected_icon = None
-            source_window = None
-
-            # -----------------------------------------------
-            # ウィンドウ内の選択
-            # -----------------------------------------------
-
-            active_window = state.get(
-                "active_window"
-            )
-
-            if active_window is not None:
-
-                # -------------------------------------------
-                # Trashの中ではClearしない
-                # -------------------------------------------
-
-                if (
-                    active_window["path"]
-                    != TRASH_PATH
-                ):
-
-                    selected_icon = (
-                        active_window.get(
-                            "selected"
-                        )
-                    )
-
-                    if selected_icon is not None:
-
-                        source_window = (
-                            active_window
-                        )
-
-            # -----------------------------------------------
-            # ウィンドウに選択がなければ
-            # デスクトップの選択を見る
-            # -----------------------------------------------
-
-            if selected_icon is None:
-
-                selected_icon = (
-                    state["desktop_selected"]
-                )
-
-                source_window = None
-
-            # -----------------------------------------------
-            # 選択されていない
-            # -----------------------------------------------
-
-            if selected_icon is None:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            # -----------------------------------------------
-            # Trashへ移動
-            # -----------------------------------------------
-
-            name = selected_icon["name"]
-            source = selected_icon["path"]
-
-            if move_to_trash(source):
-
-                # -------------------------------------------
-                # Undo情報を保存
-                # -------------------------------------------
-
-                state["undo"] = {
-                    "action": "move_to_trash",
-                    "name": name,
-                }
-                # -------------------------------------------
-                # デスクトップを更新
-                # -------------------------------------------
-
-                state["desktop_icons"] = (
-                    read_directory(HOME)
-                )
-
-                arrange_icons(
-                    state["desktop_icons"],
-                    width,
-                    height,
-                )
-
-                state["desktop_selected"] = None
-
-                # -------------------------------------------
-                # 元のウィンドウを更新
-                # -------------------------------------------
-
-                if source_window is not None:
-
-                    source_window["icons"] = (
-                        read_directory(
-                            source_window["path"]
-                        )
-                    )
-
-                    window_w = (
-                        source_window["w"]
-                    )
-
-                    columns = max(
-                        1,
-                        (window_w - 4) // 18
-                    )
-
-                    for i, icon in enumerate(
-                        source_window["icons"]
-                    ):
-
-                        column = i % columns
-                        row = i // columns
-
-                        icon["x"] = (
-                            2
-                            + column * 18
-                        )
-
-                        icon["y"] = (
-                            2
-                            + row * 3
-                        )
-
-                    source_window["selected"] = None
-
-                state["message"] = (
-                    "Moved to Trash: "
-                    + name
-                )
-
-            else:
-
-                state["message"] = (
-                    "Could not move to Trash: "
-                    + name
-                )
-
-            state["active_menu"] = None
-
-            return True
-        # ----------------------------------------------------
-        # Edit → Rename
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Rename"
-        ):
-
-            target = None
-
-            # ------------------------------------------------
-            # デスクトップの選択
-            # ------------------------------------------------
-
-            if state["desktop_selected"] is not None:
-
-                target = state["desktop_selected"]
-
-            # ------------------------------------------------
-            # ウィンドウ内の選択
-            # ------------------------------------------------
-
-            else:
-
-                for window in state["windows"]:
-
-                    if window["selected"] is not None:
-
-                        target = window["selected"]
-                        break
-
-            # ------------------------------------------------
-            # 選択されていない
-            # ------------------------------------------------
-
-            if target is None:
-
-                state["message"] = (
-                    "No item selected"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            # ------------------------------------------------
-            # Rename情報を保存
-            # ------------------------------------------------
-
-            state["rename"] = {
-                "path": target["path"],
-                "old_name": target["name"],
-                "name": target["name"],
-                "cursor": len(target["name"]),
-            }
-          
-
-            state["message"] = (
-                "Rename: "
-                + target["name"]
-            )
-
-            state["active_menu"] = None
-
-            return True
-        
-        # ----------------------------------------------------
-        # Edit → Undo
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Undo"
-        ):
-        
-
-            undo = state.get(
-                "undo"
-            )
-           
-        
-            
-
-            if undo is None:
-
-                state["message"] = (
-                    "Nothing to undo"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            if undo.get("action") == "move_to_trash":
-
-                name = undo.get(
-                    "name"
-                )
-
-                if restore_from_trash(name):
-
-                    # ---------------------------------------
-                    # デスクトップ更新
-                    # ---------------------------------------
-
-                    state["desktop_icons"] = (
-                        read_directory(HOME)
-                    )
-
-                    arrange_icons(
-                        state["desktop_icons"],
-                        width,
-                        height,
-                    )
-
-                    state["desktop_selected"] = None
-
-                    # ---------------------------------------
-                    # 開いているウィンドウを更新
-                    # ---------------------------------------
-
-                    for window in state["windows"]:
-
-                        window["icons"] = (
-                            read_directory(
-                                window["path"]
-                            )
-                        )
-
-                        window_w = window["w"]
-
-                        columns = max(
-                            1,
-                            (window_w - 4) // 18
-                        )
-
-                        for i, icon in enumerate(
-                            window["icons"]
-                        ):
-
-                            column = i % columns
-                            row = i // columns
-
-                            icon["x"] = (
-                                2
-                                + column * 18
-                            )
-
-                            icon["y"] = (
-                                2
-                                + row * 3
-                            )
-
-                        window["selected"] = None
-
-                    state["undo"] = None
-
-                    state["message"] = (
-                        "Undo: "
-                        + name
-                    )
-
-            elif undo.get("action") == "move":
-
-          
-                    source = undo.get(
-                        "source"
-                    )
-
-                    destination = undo.get(
-                        "destination"
-                    )
-
-                    name = undo.get(
-                        "name"
-                    )
-           
-
-
-                    try:
-
-                        if (
-                            source
-                            and destination
-                            and os.path.exists(source)
-                        ):
-
-                            shutil.move(
-                                source,
-                                destination,
-                            )
-
-                            # ---------------------------------------
-                            # デスクトップ更新
-                            # ---------------------------------------
-
-                            state["desktop_icons"] = (
-                                read_directory(HOME)
-                            )
-
-                            arrange_icons(
-                                state["desktop_icons"],
-                                width,
-                                height,
-                            )
-
-                            state["desktop_selected"] = None
-
-                            # ---------------------------------------
-                            # 開いているウィンドウを更新
-                            # ---------------------------------------
-
-                            for window in state["windows"]:
-
-                                window["icons"] = (
-                                    read_directory(
-                                        window["path"]
-                                    )
-                                )
-
-                                window_w = window["w"]
-
-                                columns = max(
-                                    1,
-                                    (window_w - 4) // 18
-                                )
-
-                                for i, icon in enumerate(
-                                    window["icons"]
-                                ):
-
-                                    column = i % columns
-                                    row = i // columns
-
-                                    icon["x"] = (
-                                        2
-                                        + column * 18
-                                    )
-
-                                    icon["y"] = (
-                                        2
-                                        + row * 3
-                                    )
-
-                                window["selected"] = None
-
-                            state["undo"] = None
-
-                            state["message"] = (
-                                "Undo: "
-                                + name
-                            )
-
-                        else:
-
-                            state["message"] = (
-                                "Could not undo"
-                            )
-
-                    except OSError:
-
-                        state["message"] = (
-                            "Could not undo"
-                        )
-            elif undo.get("action") == "rename":
-
-                source = undo.get(
-                    "source"
-                )
-
-                destination = undo.get(
-                    "destination"
-                )
-
-                name = undo.get(
-                    "name"
-                )
-
-                old_name = undo.get(
-                    "old_name"
-                )
-
-                try:
-
-                    if (
-                        source
-                        and destination
-                        and os.path.exists(source)
-                    ):
-
-                        os.rename(
-                            source,
-                            destination,
-                        )
-                    # ------------------------------------------------
-                    # Rename Undoによるウィンドウ更新
-                    # ------------------------------------------------
-
-                        source_abs = os.path.abspath(
-                            source
-                        )
-
-                        destination_abs = os.path.abspath(
-                            destination
-                        )
-
-                        for window in state["windows"]:
-
-                            window_path = os.path.abspath(
-                                window["path"]
-                            )
-
-                        # --------------------------------------------
-                        # Renameしたフォルダ自身
-                        # --------------------------------------------
-
-                            if window_path == source_abs:
-
-                                window["path"] = (
-                                    destination_abs
-                                )
-
-                        # --------------------------------------------
-                        # Renameしたフォルダの中にあるウィンドウ
-                        # --------------------------------------------
-
-                            elif window_path.startswith(
-                                source_abs + os.sep
-                            ):
-
-                                relative = os.path.relpath(
-                                    window_path,
-                                    source_abs,
-                                )
-
-                                window["path"] = (
-                                    os.path.join(
-                                        destination_abs,
-                                        relative,
-                                    )
-                                )
-                    # ------------------------------------------------
-                    # デスクトップ更新
-                    # ------------------------------------------------
-
-                        state["desktop_icons"] = (
-                            read_directory(HOME)
-                        )
-
-                        arrange_icons(
-                            state["desktop_icons"],
-                            width,
-                            height,
-                        )
-
-                        state["desktop_selected"] = None
-
-                    # ------------------------------------------------
-                    # ウィンドウ更新
-                    # ------------------------------------------------
-
-                        for window in state["windows"]:
-
-                            window["icons"] = (
-                                read_directory(
-                                    window["path"]
-                                )
-                            )
-
-                            window_w = window["w"]
-
-                            columns = max(
-                                1,
-                                (window_w - 4) // 18
-                            )
-
-                            for i, icon in enumerate(
-                                window["icons"]
-                            ):
-
-                                column = i % columns
-                                row = i // columns
-
-                                icon["x"] = (
-                                    2
-                                    + column * 18
-                                )
-
-                                icon["y"] = (
-                                    2
-                                    + row * 3
-                                )
-
-                            window["selected"] = None
-
-                        state["undo"] = None
-
-                        state["message"] = (
-                            "Undo: "
-                            + old_name
-                        )
-
-                    else:
-
-                        state["message"] = (
-                            "Could not undo"
-                        )
-
-                except OSError:
-
-                    state["message"] = (
-                        "Could not undo"
-                    )        
-            else:
-
-                state["message"] = (
-                    "Could not undo"
-                )
-
-                
-
-            state["active_menu"] = None
-
-            return True
-        # ----------------------------------------------------
-        # Edit → Paste
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Edit"
-            and
-            item == "Paste"
-        ):
-
-            clipboard = state.get(
-                "clipboard"
-            )
-
-            if clipboard is None:
-
-                state["message"] = (
-                    "Nothing to paste"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            clipboard_icon = clipboard.get(
-                "icon"
-            )
-
-            action = clipboard.get(
-                "action"
-            )
-  
-            if clipboard_icon is None:
-
-                state["message"] = (
-                    "Nothing to paste"
-                )
-
-                state["clipboard"] = None
-                state["active_menu"] = None
-
-                return True
-
-            source = clipboard_icon.get(
-                "path"
-            )
-
-            if not source or not os.path.exists(source):
-
-                state["message"] = (
-                    "Source no longer exists"
-                )
-
-                state["clipboard"] = None
-                state["active_menu"] = None
-
-                return True
-
-            # -----------------------------------------------
-            # 元ファイルの場所を記録
-            # -----------------------------------------------
-
-            source_dir = os.path.dirname(
-                source
-            )
-
-            # -----------------------------------------------
-            # Paste先を決定
-            # -----------------------------------------------
-
-            active_window = state.get(
-                "active_window"
-            )
-
-            if active_window is not None:
-
-                destination_dir = (
-                    active_window["path"]
-                )
-
-            else:
-
-                destination_dir = HOME
-
-            # -----------------------------------------------
-            # 同名ファイルがある場合
-            # -----------------------------------------------
-
-            original_name = os.path.basename(
-                source
-            )
-
-            name, extension = os.path.splitext(
-                original_name
-            )
-
-            destination = os.path.join(
-                destination_dir,
-                original_name,
-            )
-
-            number = 2
-
-            while os.path.exists(destination):
-
-                if extension:
-
-                    new_name = (
-                        name
-                        + " copy "
-                        + str(number)
-                        + extension
-                    )
-
-                else:
-
-                    new_name = (
-                        name
-                        + " copy "
-                        + str(number)
-                    )
-
-                destination = os.path.join(
-                    destination_dir,
-                    new_name,
-                )
-
-                number += 1
-
-            # -----------------------------------------------
-            # Copy / Cut
-            # -----------------------------------------------
-
-            try:
-
-                if action == "cut":
-
-                    shutil.move(
-                        source,
-                        destination,
-                    )
-                    state["undo"] = {
-                        "action": "move",
-                        "source": destination,
-                        "destination": source,
-                        "name": os.path.basename(destination),
-                    }
-          
-                else:
-
-                    if os.path.isdir(source):
-
-                        shutil.copytree(
-                            source,
-                            destination,
-                        )
-
-                    else:
-
-                        shutil.copy2(
-                            source,
-                            destination,
-                        )
-
-            except OSError:
-
-                state["message"] = (
-                    "Could not paste"
-                )
-
-                state["active_menu"] = None
-
-                return True
-
-            # -----------------------------------------------
-            # デスクトップを更新
-            # -----------------------------------------------
-
-            state["desktop_icons"] = (
-                read_directory(HOME)
-            )
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            # -----------------------------------------------
-            # 開いている全ウィンドウを更新
-            # -----------------------------------------------
-
-            for window in state["windows"]:
-
-                window_path = os.path.abspath(
-                    window["path"]
-                )
-
-                source_path = os.path.abspath(
-                    source_dir
-                )
-
-                destination_path = os.path.abspath(
-                    destination_dir
-                )
-
-                if (
-                    window_path == source_path
-                    or
-                    window_path == destination_path
-                ):
-
-                    window["icons"] = (
-                        read_directory(
-                            window["path"]
-                        )
-                    )
-
-                    # create_window() と同じ考え方で
-                    # アイコンを並べ直す
-
-                    window_w = window["w"]
-
-                    columns = max(
-                        1,
-                        (window_w - 4) // 18
-                    )
-
-                    for i, icon in enumerate(
-                        window["icons"]
-                    ):
-
-                        column = i % columns
-                        row = i // columns
-
-                        icon["x"] = (
-                            2
-                            + column * 18
-                        )
-
-                        icon["y"] = (
-                            2
-                            + row * 3
-                        )
-
-                    window["selected"] = None
-
-            # -----------------------------------------------
-            # Clipboardを消去
-            # -----------------------------------------------
+                push_undo(state, {
+                    "action": "move",
+                    "source": destination,
+                    "destination": source,
+                })
 
             state["clipboard"] = None
 
-            state["desktop_selected"] = None
+        else:
 
-            if action != "cut":
+            destination = unique_destination(dest_dir, name)
 
-                state["message"] = (
-                    "Pasted "
-                    + os.path.basename(destination)
-                )
-
-            state["active_menu"] = None
-           
-
-            return True
-  
-        # ----------------------------------------------------
-        # View → Clean Up
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "View"
-            and
-            item == "Clean Up"
-        ):
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            state["desktop_selected"] = None
-
-            state["message"] = (
-                "Cleaned Up"
-            )
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # View → by Name
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "View"
-            and
-            item == "by Name"
-        ):
-
-            state["desktop_icons"].sort(
-                key=lambda icon: (
-                    icon["type"] != "folder",
-                    icon["name"].lower(),
-                )
-            )
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            state["desktop_selected"] = None
-
-            state["message"] = (
-                "Sorted by Name"
-            )
-
-            state["active_menu"] = None
-
-            return True
-
-
-        # ----------------------------------------------------
-        # View → by Date
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "View"
-            and
-            item == "by Date"
-        ):
-
-            def modification_time(icon):
-
-                try:
-                    return os.path.getmtime(
-                        icon["path"]
-                    )
-
-                except (
-                    FileNotFoundError,
-                    PermissionError,
-                    OSError,
-                ):
-                    return 0
-
-            state["desktop_icons"].sort(
-                key=lambda icon: (
-                    icon["type"] != "folder",
-                    -modification_time(icon),
-                )
-            )
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            state["desktop_selected"] = None
-
-            state["message"] = (
-                "Sorted by Date"
-            )
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # View → by Icon
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "View"
-            and
-            item == "by Icon"
-        ):
-
-            state["desktop_icons"].sort(
-                key=lambda icon: (
-                    icon["type"] != "folder",
-                    icon["name"].lower(),
-                )
-            )
-
-            arrange_icons(
-                state["desktop_icons"],
-                width,
-                height,
-            )
-
-            state["desktop_selected"] = None
-
-            state["message"] = (
-                "Arranged by Icon"
-            )
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # Special → Restart
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Special"
-            and
-            item == "Restart"
-        ):
-
-            state["dialog"] = {
-                "type": "confirm",
-                "message": (
-                    "Are you sure you want to restart?"
-                ),
-                "action": "restart",
-            }
-
-            state["active_menu"] = None
-
-            return True
-
-        # ----------------------------------------------------
-        # Special → Shut Down
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Special"
-            and
-            item == "Shut Down"
-        ):
-
-            state["dialog"] = {
-                "type": "confirm",
-                "message": (
-                    "Are you sure you want to shut down?"
-                ),
-                "action": "shutdown",
-            }
-
-            state["active_menu"] = None
-
-            return True
-
-
-        # ----------------------------------------------------
-        # Special → Empty Trash
-        # ----------------------------------------------------
-
-        if (
-            menu_name == "Special"
-            and
-            item == "Empty Trash"
-        ):
-
-            state["dialog"] = {
-                "type": "confirm", 
-                "message": ( 
-                    "Are you sure you want to empty the Trash?" 
-                    ), 
-                    "action": "empty_trash", 
-            } 
-            
-            state["active_menu"] = None 
-            
-            return True
-
-            if empty_trash():
-
-                # ------------------------------------------------
-                # 開いているTrashウィンドウを更新
-                # ------------------------------------------------
-
-                for window in state["windows"]:
-
-                    if window["path"] == TRASH_PATH:
-
-                        window["icons"] = read_directory(
-                            TRASH_PATH
-                        )
-
-                        window["selected"] = None
-
-                state["message"] = (
-                    "Trash emptied"
-                )
-
+            if os.path.isdir(source) and not os.path.islink(source):
+                shutil.copytree(source, destination, symlinks=True)
             else:
+                shutil.copy2(source, destination, follow_symlinks=False)
 
-                state["message"] = (
-                    "Could not empty Trash"
-                )
+            push_undo(state, {"action": "copy", "path": destination})
 
-            state["active_menu"] = None
+    except (OSError, shutil.Error):
+        say(state, "Could not paste")
+        return
 
-            return True
+    refresh_all(stdscr, state, select_path=destination)
+    say(state, "Pasted " + os.path.basename(destination))
 
-        # ----------------------------------------------------
-        # その他のメニュー項目
-        # ----------------------------------------------------
 
-        state["active_menu"] = None
+def act_rename(stdscr, state):
 
+    icon, window = current_selection(state)
+
+    if icon is None:
+        say(state, "No item selected")
+        return
+
+    if same_path(os.path.dirname(icon["path"]), TRASH_PATH):
+        say(state, "Cannot rename Trash items")
+        return
+
+    state["rename"] = {
+        "path": icon["path"],
+        "old_name": icon["name"],
+        "name": icon["name"],
+        "cursor": len(icon["name"]),
+    }
+
+    say(state, "Rename: " + icon["name"])
+
+
+def act_clear(stdscr, state):
+
+    icon, window = current_selection(state)
+
+    if icon is None:
+        say(state, "No item selected")
+        return
+
+    trash_item(stdscr, state, icon)
+
+
+def _sort(stdscr, state, mode):
+
+    window = state["active_window"]
+    icons = window["icons"] if window else state["desktop_icons"]
+
+    def mtime(icon):
+        try:
+            return os.path.getmtime(icon["path"])
+        except OSError:
+            return 0
+
+    if mode == "name":
+        icons.sort(key=lambda i: i["name"].lower())
+    elif mode == "date":
+        icons.sort(key=lambda i: (i["type"] != "folder", -mtime(i)))
+    else:
+        icons.sort(key=lambda i: (i["type"] != "folder", i["name"].lower()))
+
+    if window:
+        layout_window_icons(window)
+    else:
+        height, width = stdscr.getmaxyx()
+        arrange_icons(icons, width, height)
+        state["desktop_scroll"] = 0
+
+    say(state, "Sorted by " + mode)
+
+
+def act_by_icon(stdscr, state):
+    _sort(stdscr, state, "icon")
+
+
+def act_by_name(stdscr, state):
+    _sort(stdscr, state, "name")
+
+
+def act_by_date(stdscr, state):
+    _sort(stdscr, state, "date")
+
+
+def act_clean_up(stdscr, state):
+
+    window = state["active_window"]
+
+    if window:
+        layout_window_icons(window)
+    else:
+        height, width = stdscr.getmaxyx()
+        arrange_icons(state["desktop_icons"], width, height)
+        state["desktop_scroll"] = 0
+
+    say(state, "Cleaned Up")
+
+
+def act_show_hidden(stdscr, state):
+
+    set_show_hidden(not show_hidden_enabled())
+    refresh_all(stdscr, state)
+
+    say(state, "Hidden files: " + ("shown" if show_hidden_enabled() else "hidden"))
+
+
+def act_empty_trash(stdscr, state):
+    ask(state, "Are you sure you want to empty the Trash?", "empty_trash")
+
+
+def act_restart(stdscr, state):
+    ask(state, "Are you sure you want to restart?", "restart")
+
+
+def act_shutdown(stdscr, state):
+    ask(state, "Are you sure you want to shut down?", "shutdown")
+
+
+MENU_ACTIONS = {
+    (APPLE_SYMBOL, "About This Macintosh"): act_about,
+    (APPLE_SYMBOL, "Control Panel"): act_not_implemented,
+    (APPLE_SYMBOL, "Calculator"): act_not_implemented,
+
+    ("File", "New Window"): act_new_window,
+    ("File", "New Folder"): act_new_folder,
+    ("File", "Open"): act_open,
+    ("File", "Open in Editor"): act_open_in_editor,
+    ("File", "Get Info"): act_get_info,
+    ("File", "Put Back"): act_put_back,
+    ("File", "Close"): act_close,
+    ("File", "Quit"): act_quit,
+
+    ("Edit", "Undo"): act_undo,
+    ("Edit", "Cut"): act_cut,
+    ("Edit", "Copy"): act_copy,
+    ("Edit", "Paste"): act_paste,
+    ("Edit", "Rename"): act_rename,
+    ("Edit", "Clear"): act_clear,
+
+    ("View", "by Icon"): act_by_icon,
+    ("View", "by Name"): act_by_name,
+    ("View", "by Date"): act_by_date,
+    ("View", "Clean Up"): act_clean_up,
+    ("View", "Show Hidden"): act_show_hidden,
+
+    ("Special", "Empty Trash"): act_empty_trash,
+    ("Special", "Restart"): act_restart,
+    ("Special", "Shut Down"): act_shutdown,
+}
+
+
+# ============================================================
+# ダイアログ
+# ============================================================
+
+def run_dialog_action(stdscr, state, dialog):
+
+    action = dialog.get("action")
+
+    if action == "quit":
+        state["running"] = False
+
+    elif action in ("restart", "shutdown"):
+
+        command = "reboot" if action == "restart" else "poweroff"
+        ok, error = run_external(stdscr, ["sudo", command])
+
+        say(state, command if ok else "Could not " + command + ": " + error)
+
+    elif action == "empty_trash":
+
+        ok = empty_trash()
+        refresh_all(stdscr, state)
+        say(state, "Trash emptied" if ok else "Could not empty Trash")
+
+    elif action == "run":
+        launch_file(stdscr, state, dialog["path"])
+
+
+def answer_dialog(stdscr, state, yes):
+
+    dialog = state["dialog"]
+    state["dialog"] = None
+
+    if yes:
+        run_dialog_action(stdscr, state, dialog)
+    else:
+        say(state, "Cancelled")
+
+
+def handle_dialog_click(stdscr, state, x, y):
+
+    height, width = stdscr.getmaxyx()
+    lay = confirm_layout(width, height, state["dialog"])
+
+    if y != lay["btn_y"]:
+        return
+
+    if lay["yes"][0] <= x < lay["yes"][1]:
+        answer_dialog(stdscr, state, True)
+
+    elif lay["no"][0] <= x < lay["no"][1]:
+        answer_dialog(stdscr, state, False)
+
+
+# ============================================================
+# 4. ドラッグ処理
+# ============================================================
+
+def start_desktop_drag(state, icon, x, y):
+
+    state["drag"] = {
+        "kind": "desktop",
+        "icon": icon,
+        "window": None,
+        "off_x": x - icon["x"],
+        "off_y": y - (icon["y"] - state["desktop_scroll"]),
+        "start": (x, y),
+        "moved": False,
+    }
+
+
+def start_window_icon_drag(state, window, icon, x, y):
+
+    state["drag"] = {
+        "kind": "window_icon",
+        "icon": icon,
+        "window": window,
+        "off_x": x - window["x"] - icon["x"],
+        "off_y": y - window["y"] + window["scroll"] - icon["y"],
+        "start": (x, y),
+        "moved": False,
+    }
+
+
+def update_drag(stdscr, state):
+
+    drag = state["drag"]
+    icon = drag["icon"]
+
+    x = state["mouse_x"]
+    y = state["mouse_y"]
+
+    if (x, y) != drag["start"]:
+        drag["moved"] = True
+
+    height, width = stdscr.getmaxyx()
+
+    if drag["kind"] == "desktop":
+
+        screen_x = max(1, min(width - 8, x - drag["off_x"]))
+        screen_y = max(DESKTOP_TOP, min(height - 6, y - drag["off_y"]))
+
+        icon["x"] = screen_x
+        icon["y"] = screen_y + state["desktop_scroll"]
+
+    elif drag["kind"] == "window_icon":
+
+        window = drag["window"]
+
+        # ウィンドウの外へ出たら「アイコン移動」→「ファイル移動」へ切替
+        if not point_in_window(window, x, y):
+            drag["kind"] = "item"
+            say(state, "Move: " + icon["name"])
+            return
+
+        new_x = x - window["x"] - drag["off_x"]
+        new_y = y - window["y"] + window["scroll"] - drag["off_y"]
+
+        max_y = max(i["y"] for i in window["icons"]) + 3
+
+        icon["x"] = max(2, min(window["w"] - 10, new_x))
+        icon["y"] = max(2, min(max_y, new_y))
+
+
+def finish_drag(stdscr, state):
+
+    drag = state["drag"]
+    state["drag"] = None
+
+    # 動かさずに離した = ただのクリック。何もしない
+    if not drag["moved"]:
+        return
+
+    icon = drag["icon"]
+    x = state["mouse_x"]
+    y = state["mouse_y"]
+
+    kind, path = drop_target(stdscr, state, x, y, icon)
+
+    if kind == "trash":
+        trash_item(stdscr, state, icon)
+        return
+
+    # アイコン位置を変えただけの場合は quiet_same
+    move_item(
+        stdscr, state, icon, path,
+        quiet_same=(drag["kind"] in ("desktop", "window_icon")),
+    )
+
+
+def start_window_drag(state, window, x, y):
+
+    state["dragging_window"] = window
+    state["window_drag_offset_x"] = x - window["x"]
+    state["window_drag_offset_y"] = y - window["y"]
+
+
+def update_window_drag(stdscr, state):
+
+    window = state["dragging_window"]
+    height, width = stdscr.getmaxyx()
+
+    new_x = state["mouse_x"] - state["window_drag_offset_x"]
+    new_y = state["mouse_y"] - state["window_drag_offset_y"]
+
+    window["x"] = max(1, min(width - window["w"] - 1, new_x))
+    window["y"] = max(3, min(height - window["h"] - 1, new_y))
+
+
+def update_resize(stdscr, state):
+
+    window = state["resizing_window"]
+    height, width = stdscr.getmaxyx()
+
+    new_w = max(20, state["mouse_x"] - window["x"] + 1)
+    new_h = max(7, state["mouse_y"] - window["y"] + 1)
+
+    window["w"] = min(new_w, width - window["x"] - 1)
+    window["h"] = min(new_h, height - window["y"] - 1)
+
+    # 幅が変わったらアイコンを並べ直す
+    layout_window_icons(window)
+
+
+# ============================================================
+# 5. マウス入力
+# ============================================================
+
+def handle_menu_click(stdscr, state, x, y):
+    """メニューが処理したら True"""
+
+    height, width = stdscr.getmaxyx()
+
+    clicked = menu_at(x, y)
+
+    if clicked is not None:
+        state["active_menu"] = (
+            None if state["active_menu"] == clicked else clicked)
         return True
 
-    return False
+    if state["active_menu"] is None:
+        return False
 
-# ============================================================
-# マウスイベント
-# ============================================================
+    menu_name = state["active_menu"]
+    state["active_menu"] = None
 
-def handle_mouse_event(
-    stdscr,
-    state,
-):
+    item = menu_item_at(menu_name, x, y, width)
 
-    try:
+    action = MENU_ACTIONS.get((menu_name, item))
 
-        (
-            _,
-            mx,
-            my,
-            _,
-            mouse_state,
-        ) = curses.getmouse()
+    if action is not None:
+        action(stdscr, state)
 
-    
- 
-    except curses.error:
+    return True
 
+
+def handle_window_press(stdscr, state, window, x, y):
+
+    bring_to_front(state["windows"], window)
+    state["active_window"] = window
+
+    if point_on_close_button(window, x, y):
+
+        name = window_title(window)
+        close_window(state["windows"], window)
+        state["active_window"] = get_active_window(state["windows"])
+        say(state, "Closed: " + name)
         return
- 
-    height, width = (
-        stdscr.getmaxyx()
+
+    if point_on_resize_handle(window, x, y):
+        state["resizing_window"] = window
+        say(state, "Resize window")
+        return
+
+    if point_in_titlebar(window, x, y):
+        start_window_drag(state, window, x, y)
+        say(state, "Move window: " + window["path"])
+        return
+
+    icon = window_icon_at(window, x, y)
+
+    if icon is None:
+        clear_selection(state)
+        return
+
+    select_icon(state, icon, window)
+    say(state, "Selected: " + icon["name"])
+
+    if is_double_click(state, icon["path"]):
+        open_icon(stdscr, state, icon)
+        return
+
+    start_window_icon_drag(state, window, icon, x, y)
+
+
+def handle_trash_press(stdscr, state):
+
+    clear_selection(state)
+    state["trash_selected"] = True
+    state["active_window"] = None
+
+    if is_double_click(state, "<trash>"):
+        open_folder_window(stdscr, state, TRASH_PATH)
+        state["trash_selected"] = False
+        say(state, "Opened: Trash")
+
+
+def handle_desktop_press(stdscr, state, x, y):
+
+    height, width = stdscr.getmaxyx()
+
+    icon = desktop_icon_at(state, x, y, height)
+
+    clear_selection(state)
+    state["active_window"] = None
+
+    if icon is None:
+        return
+
+    select_icon(state, icon)
+    say(state, "Selected: " + icon["name"])
+
+    if is_double_click(state, icon["path"]):
+        open_icon(stdscr, state, icon)
+        return
+
+    start_desktop_drag(state, icon, x, y)
+
+
+def handle_press(stdscr, state, x, y):
+
+    height, width = stdscr.getmaxyx()
+
+    if handle_menu_click(stdscr, state, x, y):
+        return
+
+    window = window_at(state["windows"], x, y)
+
+    if window is not None:
+        handle_window_press(stdscr, state, window, x, y)
+        return
+
+    if point_in_trash(width, height, x, y):
+        handle_trash_press(stdscr, state)
+        return
+
+    handle_desktop_press(stdscr, state, x, y)
+
+
+def wheel(stdscr, state, x, y, direction):
+
+    window = window_at(state["windows"], x, y)
+
+    if window is not None:
+        scroll_window(window, 3 * direction)
+        return
+
+    height, width = stdscr.getmaxyx()
+
+    state["desktop_scroll"] = max(
+        0,
+        min(
+            state["desktop_scroll"] + 4 * direction,
+            desktop_max_scroll(state["desktop_icons"], height),
+        ),
     )
 
-    update_mouse_position(
-        state,
-        width,
-        height,
-        mx,
-        my,
-    )
 
-    mouse_x = state["mouse_x"]
-    mouse_y = state["mouse_y"]
+def handle_mouse_event(stdscr, state, event=None):
+    """
+    event: (id, x, y, z, bstate)
+    None のときは curses.getmouse() から読む。
+    キーボードマウスは自前キューから直接ここへ渡す。
+    """
 
-   
-    
-    # ========================================================
-    # マウスホイール
-    # ========================================================
+    if event is None:
+        try:
+            event = curses.getmouse()
+        except curses.error:
+            return
 
-    if mouse_state & curses.BUTTON4_PRESSED:
+    _, mx, my, _, bstate = event
 
-        window = window_at(
-            state["windows"],
-            mouse_x,
-            mouse_y,
-        )
+    height, width = stdscr.getmaxyx()
+    update_mouse_position(state, width, height, mx, my)
 
-        if window is not None:
+    x = state["mouse_x"]
+    y = state["mouse_y"]
 
-            scroll_window(
-                window,
-                -3,
-            )
+    # --------------------------------------------------------
+    # モーダル (Get Info / Rename / 確認)
+    # --------------------------------------------------------
 
-        return
+    if state["info"] is not None:
 
-
-    if mouse_state & curses.BUTTON5_PRESSED:
-
-        window = window_at(
-            state["windows"],
-            mouse_x,
-            mouse_y,
-        )
-
-        if window is not None:
-
-            scroll_window(
-                window,
-                3,
-            )
+        if bstate & BTN_PRESS:
+            state["info"] = None
 
         return
 
-    # ========================================================
-    # 確認ダイアログ
-    # ========================================================
+    if state["rename"] is not None:
+        return
 
     if state["dialog"] is not None:
 
-        if mouse_state & curses.BUTTON1_PRESSED:
-
-            height, width = (
-                stdscr.getmaxyx()
-            )
-
-            dialog_w = max(
-                40,
-                len(
-                    state["dialog"]["message"]
-                ) + 8,
-            )
-
-            dialog_w = min(
-                dialog_w,
-                width - 4,
-            )
-
-            dialog_h = 7
-
-            dialog_x = (
-                width - dialog_w
-            ) // 2
-
-            dialog_y = (
-                height - dialog_h
-            ) // 2
-
-            # ------------------------------------------------
-            # Yes
-            # ------------------------------------------------
-
-            yes_text = "[ Yes ]"
-
-            yes_x = (
-                dialog_x
-                + (
-                    dialog_w
-                    - len(
-                        "[ Yes ]    [ No ]"
-                    )
-                ) // 2
-            )
-
-            no_x = (
-                yes_x
-                + len("[ Yes ]")
-                + 4
-            )
-
-            if (
-                dialog_y + 4 == mouse_y
-                and
-                yes_x <= mouse_x
-                < yes_x + len(yes_text)
-            ):
-
-                action = state["dialog"].get(
-                    "action"
-                )
-
-                state["dialog"] = None
-
-                if action == "restart":
-
-                    subprocess.Popen(
-                        [
-                             "tmux",
-                            "new-window",
-                            "sudo reboot"
-                            
-                        ]
-                    )
-
-                    return                
-                
-                if action == "shutdown":
-
-                    subprocess.Popen(
-                        [
-                             "tmux",
-                            "new-window",
-                            "sudo poweroff"
-                            
-                        ]
-                    )
-
-                    return
-                    
-                if action == "empty_trash":
-
-                    if empty_trash():
-
-                        for window in state["windows"]:
-
-                            if (
-                                window["path"]
-                                == TRASH_PATH
-                            ):
-
-                                window["icons"] = (
-                                    read_directory(
-                                        TRASH_PATH
-                                    )
-                                )
-
-                                window["selected"] = (
-                                    None
-                                )
-
-                        state["message"] = (
-                            "Trash emptied"
-                        )
-
-                    else:
-
-                        state["message"] = (
-                            "Could not empty Trash"
-                        )
-
-                return
-
-            # ------------------------------------------------
-            # No
-            # ------------------------------------------------
-
-            if (
-                dialog_y + 4 == mouse_y
-                and
-                no_x <= mouse_x
-                < no_x + len("[ No ]")
-            ):
-
-                state["dialog"] = None
-
-                state["message"] = (
-                    "Cancelled"
-                )
-
-                return
+        if bstate & BTN_PRESS:
+            handle_dialog_click(stdscr, state, x, y)
 
         return
 
     # --------------------------------------------------------
-    # ウィンドウ内アイコンのドラッグ
+    # ホイール
     # --------------------------------------------------------
 
-    if state["window_icon_dragging"] is not None:
-
-        drag = state["window_icon_dragging"]
-
-        drag_window = drag["window"]
-        drag_icon = drag["icon"]
-
-        # ----------------------------------------------------
-        # 元のウィンドウの外へ出たか確認
-        # ----------------------------------------------------
-
-        inside_source_window = point_in_window(
-            drag_window,
-            mouse_x,
-            mouse_y,
-        )
-
-        # ----------------------------------------------------
-        # ウィンドウの外へ出たら
-        # 「ウィンドウ内移動」から
-        # 「ファイル・フォルダ移動」へ切り替える
-        # ----------------------------------------------------
-
-        if not inside_source_window:
-
-            state["dragging_item"] = drag_icon
-            state["dragging_item_window"] = drag_window
-
-            state["window_icon_dragging"] = None
-            state["window_icon_drag_offset_x"] = 0
-            state["window_icon_drag_offset_y"] = 0
-
-            state["message"] = (
-                "Move: "
-                + drag_icon["name"]
-            )
-
-            # ------------------------------------------------
-            # そのまま外へドラッグしているので、
-            # ボタンを離した瞬間に移動処理へ進ませる
-            # ------------------------------------------------
-
-            if mouse_state == curses.BUTTON1_RELEASED:
-
-                drop_item_on_folder(
-                    state,
-                    width,
-                    height,
-                )
-
-                state["dragging_item"] = None
-                state["dragging_item_window"] = None
-
-            return
-
-        # ----------------------------------------------------
-        # まだ元のウィンドウ内なら
-        # 通常のアイコン移動
-        # ----------------------------------------------------
-
-        update_window_icon_drag(
-            state,
-        )
-
-        if mouse_state & curses.BUTTON1_RELEASED:
-
-            state["window_icon_dragging"] = None
-            state["window_icon_drag_offset_x"] = 0
-            state["window_icon_drag_offset_y"] = 0
-
+    if bstate & WHEEL_UP:
+        wheel(stdscr, state, x, y, -1)
         return
 
-    # ========================================================
-    # ファイル・フォルダをドラッグ中
-    # ========================================================
-
-    if state["dragging_item"] is not None:
-
-        if mouse_state & curses.BUTTON1_RELEASED:
-
-            drop_item_on_folder(
-                state,
-                width, 
-                height,                               
-            )
-
-            state["dragging_item"] = None
-            state["dragging_item_window"] = None
-
+    if bstate & WHEEL_DOWN:
+        wheel(stdscr, state, x, y, 1)
         return
 
+    released = bool(bstate & BTN_RELEASE)
 
+    # --------------------------------------------------------
+    # ドラッグ中 (通常のクリック判定より先に処理)
+    # --------------------------------------------------------
 
-    # ========================================================
-    # デスクトップアイコンをドラッグ中
-    # ========================================================
-    #
-    # 通常のクリック判定より先に処理する。
-    # これにより Trash の上へ移動しても
-    # ドラッグが途中で途切れない。
-    #
+    if state["drag"] is not None:
 
-    if state["desktop_dragging"] is not None:
+        update_drag(stdscr, state)
 
-        update_desktop_drag(
-            state,
-            width,
-            height,
-        )
-
-        if mouse_state & curses.BUTTON1_RELEASED:
-
-            drop_desktop_icon(
-                state,
-                width,
-                height,
-            )
-
-            state["desktop_dragging"] = None
+        if released:
+            finish_drag(stdscr, state)
 
         return
-
-    # ========================================================
-    # ウィンドウ移動中
-    # ========================================================
 
     if state["dragging_window"] is not None:
 
-        update_window_drag(
-            state,
-            width,
-            height,
-        )
+        update_window_drag(stdscr, state)
 
-        if mouse_state & curses.BUTTON1_RELEASED:
-
+        if released:
             state["dragging_window"] = None
 
         return
 
-    # ========================================================
-    # ウィンドウリサイズ中
-    # ========================================================
-
     if state["resizing_window"] is not None:
 
-        update_resize(
-            state,
-            width,
-            height,
-        )
+        update_resize(stdscr, state)
 
-        if mouse_state & curses.BUTTON1_RELEASED:
-
+        if released:
             state["resizing_window"] = None
 
         return
 
-    # ========================================================
-    # マウスボタン押下
-    # ========================================================
+    # --------------------------------------------------------
+    # ボタン押下
+    # --------------------------------------------------------
 
-    if mouse_state & curses.BUTTON1_PRESSED:
+    if bstate & BTN_PRESS:
+        handle_press(stdscr, state, x, y)
 
-        # ----------------------------------------------------
-        # メニュー
-        # ----------------------------------------------------
 
-        if handle_menu_click(
-            state,
-            mouse_x,
-            mouse_y,
-            width, 
-            height,
-        ):
+# ============================================================
+# 6. キーボード入力
+# ============================================================
 
-            return
+def handle_escape(stdscr, state):
 
-        # ----------------------------------------------------
-        # Trashクリック
-        # ----------------------------------------------------
-
-        if point_in_trash(
-            width,
-            height,
-            mouse_x,
-            mouse_y,
-        ):
-
-            state["trash_selected"] = True
-            state["active_window"] = None
-
-            if is_double_click(
-                state,
-                state["trash_item"],
-            ):
-
-                new_window = create_window(
-                    TRASH_PATH,
-                    len(
-                        state["windows"]
-                    ) + 1,
-                    width,
-                    height,
-                )
-
-                state["windows"].append(
-                    new_window
-                )
-
-                state["active_window"] = (
-                    get_active_window(
-                        state["windows"]
-                    )
-                )
-
-                state["trash_selected"] = False
-
-                state["message"] = (
-                    "Opened: Trash"
-                )
-
-            return
-
-        # ----------------------------------------------------
-        # ウィンドウ
-        # ----------------------------------------------------
-
-        window = window_at(
-            state["windows"],
-            mouse_x,
-            mouse_y,
-        )
-
-        if window is not None:
-         
-            handle_window_click(
-                state,
-                window,
-                mouse_x,
-                mouse_y,
-                width,
-                height,
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # デスクトップ
-        # ----------------------------------------------------
-
-        handle_desktop_click(
-            state,
-            mouse_x,
-            mouse_y,
-            width,
-            height,
-        )
-
+    if any_drag(state):
+        cancel_drags(state)
+        say(state, "Cancelled")
         return
 
-    # ========================================================
-    # マウスボタン離す
-    # ========================================================
+    if state["active_menu"] is not None:
+        state["active_menu"] = None
+        return
 
-    if mouse_state == curses.BUTTON1_RELEASED:
+    if state["windows"]:
 
-        state["desktop_dragging"] = None
+        state["windows"].pop()
+        state["active_window"] = get_active_window(state["windows"])
+        say(state, "Window closed")
 
-        state["dragging_window"] = None
 
-        state["resizing_window"] = None
+def handle_rename_key(stdscr, state, code, text):
 
-        state["window_icon_press"] = None
-# ============================================================
-# メインイベント
-# ============================================================
+    rename = state["rename"]
+    name = rename["name"]
+    cursor = rename["cursor"]
 
-def handle_event(
-    stdscr,
-    key,
-    state,
-):
-    # ========================================================
-    # Get Info ダイアログ
-    # ========================================================
+    if code in ENTER_KEYS:
+        commit_rename(stdscr, state)
+
+    elif code == 27:
+        state["rename"] = None
+        say(state, "Rename cancelled")
+
+    elif code in (curses.KEY_BACKSPACE, 127, 8):
+
+        if cursor > 0:
+            rename["name"] = name[:cursor - 1] + name[cursor:]
+            rename["cursor"] = cursor - 1
+
+    elif code == curses.KEY_DC:
+        rename["name"] = name[:cursor] + name[cursor + 1:]
+
+    elif code == curses.KEY_LEFT:
+        rename["cursor"] = max(0, cursor - 1)
+
+    elif code == curses.KEY_RIGHT:
+        rename["cursor"] = min(len(name), cursor + 1)
+
+    elif code == curses.KEY_HOME:
+        rename["cursor"] = 0
+
+    elif code == curses.KEY_END:
+        rename["cursor"] = len(name)
+
+    elif text and text.isprintable():
+        # 日本語など ASCII 以外も入力可能
+        rename["name"] = name[:cursor] + text + name[cursor:]
+        rename["cursor"] = cursor + len(text)
+
+
+def handle_event(stdscr, code, text, state):
+    """
+    code: キーコード (get_wch の結果を int 化したもの)
+    text: 文字入力なら 1 文字の str、特殊キーなら None
+    """
+
+    # 実マウスのイベントは常に読み取る (モーダル中も消費する)
+    if code == curses.KEY_MOUSE:
+        handle_mouse_event(stdscr, state)
+        return
 
     if state["info"] is not None:
 
-        # Enter / Esc で閉じる
-        if key in (
-            curses.KEY_ENTER,
-            10,
-            13,
-            27,
-        ):
-
+        if code in ENTER_KEYS or code == 27:
             state["info"] = None
-
-            state["message"] = (
-                "Get Info closed"
-            )
+            say(state, "Get Info closed")
 
         return
-    # ========================================================
-    # Rename入力
-    # ========================================================
 
     if state["rename"] is not None:
-
-        rename = state["rename"]
-
-        # ----------------------------------------------------
-        # Enter → 確定
-        # ----------------------------------------------------
-
-        if key in (
-            curses.KEY_ENTER,
-            10,
-            13,
-        ):
-
-            new_name = rename["name"]
-
-            if new_name == "":
-
-                state["message"] = (
-                    "Name cannot be empty"
-                )
-
-                return
-
-            if "/" in new_name:
-
-                state["message"] = (
-                    "Invalid name"
-                )
-
-                return
-
-            if new_name in (
-                ".",
-                "..",
-            ):
-
-                state["message"] = (
-                    "Invalid name"
-                )
-
-                return
-
-            old_path = rename["path"]
-
-            old_name = rename["old_name"]
-
-            new_path = os.path.join(
-                os.path.dirname(old_path),
-                new_name,
-            )
-
-            if (
-                new_path != old_path
-                and
-                os.path.exists(new_path)
-            ):
-
-                state["message"] = (
-                    "Already exists"
-                )
-
-                return
-
-            try:
-
-                # ------------------------------------------------
-                # 実際に名前を変更
-                # ------------------------------------------------
-
-                os.rename(
-                    old_path,
-                    new_path,
-                )
-                # ------------------------------------------------
-                # Renameしたフォルダを開いているウィンドウを更新
-                # ------------------------------------------------
-
-                old_abs = os.path.abspath(
-                    old_path
-                )
-
-                new_abs = os.path.abspath(
-                    new_path
-                )
-
-                for window in state["windows"]:
-
-                    window_path = os.path.abspath(
-                        window["path"]
-                    )
-
-                    # --------------------------------------------
-                    # Renameしたフォルダ自身
-                    # --------------------------------------------
-
-                    if window_path == old_abs:
-
-                        window["path"] = new_abs
-
-                    # --------------------------------------------
-                    # Renameしたフォルダの中にあるウィンドウ
-                    # --------------------------------------------
-
-                    elif window_path.startswith(
-                        old_abs + os.sep
-                    ):
-
-                        relative = os.path.relpath(
-                            window_path,
-                            old_abs,
-                        )
-
-                        window["path"] = os.path.join(
-                            new_abs,
-                            relative,
-                        )
-                # ------------------------------------------------
-                # Undo情報を保存
-                # ------------------------------------------------
-
-                state["undo"] = {
-                    "action": "rename",
-                    "source": new_path,
-                    "destination": old_path,
-                    "name": new_name,
-                    "old_name": old_name,
-                }
-                
-                # ------------------------------------------------
-                # デスクトップ更新
-                # ------------------------------------------------
-
-                height, width = (
-                    stdscr.getmaxyx()
-                )
-
-                state["desktop_icons"] = (
-                    read_directory(HOME)
-                )
-
-                arrange_icons(
-                    state["desktop_icons"],
-                    width,
-                    height,
-                )
-
-                state["desktop_selected"] = None
-
-                # ------------------------------------------------
-                # 開いているウィンドウを更新
-                # ------------------------------------------------
-
-                for window in state["windows"]:
-
-                    window["icons"] = (
-                        read_directory(
-                            window["path"]
-                        )
-                    )
-
-                    window_w = window["w"]
-
-                    columns = max(
-                        1,
-                        (window_w - 4) // 18
-                    )
-
-                    for i, icon in enumerate(
-                        window["icons"]
-                    ):
-
-                        column = i % columns
-                        row = i // columns
-
-                        icon["x"] = (
-                            2
-                            + column * 18
-                        )
-
-                        icon["y"] = (
-                            2
-                            + row * 3
-                        )
-
-                    window["selected"] = None
-
-                # ------------------------------------------------
-                # Rename終了
-                # ------------------------------------------------
-
-                state["rename"] = None
-
-                state["message"] = (
-                    "Renamed: "
-                    + new_name
-                )
-
-            except OSError:
-
-                state["message"] = (
-                    "Could not rename"
-                )
-
-            return
-
-
-        # ----------------------------------------------------
-        # Esc → キャンセル
-        # ----------------------------------------------------
-
-        if key == 27:
-
-            state["rename"] = None
-
-            state["message"] = (
-                "Rename cancelled"
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # Backspace
-        # ----------------------------------------------------
-
-        if key in (
-            curses.KEY_BACKSPACE,
-            127,
-            8,
-        ):
-
-            cursor = rename["cursor"]
-
-            if cursor > 0:
-
-                name = rename["name"]
-
-                rename["name"] = (
-                    name[:cursor - 1]
-                    +
-                    name[cursor:]
-                )
-
-                rename["cursor"] -= 1
-
-            return
-
-        # ----------------------------------------------------
-        # 通常文字
-        # ----------------------------------------------------
-
-        if 32 <= key <= 126:
-
-            cursor = rename["cursor"]
-
-            name = rename["name"]
-
-            rename["name"] = (
-                name[:cursor]
-                +
-                chr(key)
-                +
-                name[cursor:]
-            )
-
-            rename["cursor"] += 1
-
-            return
-
+        handle_rename_key(stdscr, state, code, text)
         return
-        
-    if key in (
-        ord("q"),
-        ord("Q"),
-    ):
 
-        state["running"] = False
+    if state["dialog"] is not None:
+
+        if code in ENTER_KEYS or code in (ord("y"), ord("Y")):
+            answer_dialog(stdscr, state, True)
+
+        elif code in (27, ord("n"), ord("N")):
+            answer_dialog(stdscr, state, False)
 
         return
 
-    if key == 27:
+    if code in (ord("q"), ord("Q")):
+        act_quit(stdscr, state)
 
-        handle_escape(
-            state,
-        )
+    elif code == 27:
+        handle_escape(stdscr, state)
 
-        return
-
-    if key == curses.KEY_MOUSE:
-
-        handle_mouse_event(
-            stdscr,
-            state,
-        )
-
-
+    elif code in ENTER_KEYS:
+        act_open(stdscr, state)

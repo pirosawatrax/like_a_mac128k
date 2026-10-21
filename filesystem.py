@@ -6,6 +6,9 @@
 import os
 
 from constants import (
+    HOME,
+    TRASH_PATH,
+    HIDE_DOTFILES,
     DESKTOP_MARGIN_X,
     DESKTOP_MARGIN_Y,
     DESKTOP_COLUMN_WIDTH,
@@ -14,201 +17,214 @@ from constants import (
     DIR_SYMBOL,
 )
 
+_show_hidden = not HIDE_DOTFILES
+
+
+def set_show_hidden(value):
+    global _show_hidden
+    _show_hidden = bool(value)
+
+
+def show_hidden_enabled():
+    return _show_hidden
+
+
+# ============================================================
+# パス判定
+# ============================================================
+
+def same_path(a, b):
+    return os.path.abspath(a) == os.path.abspath(b)
+
+
+def is_inside(path, parent):
+    """path が parent の内側にあるか (同一は False)"""
+
+    path = os.path.abspath(path)
+    parent = os.path.abspath(parent)
+
+    if path == parent:
+        return False
+
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:
+        return False
+
+
+def unique_destination(directory, name):
+    """
+    directory 内で重複しないパスを返す。
+    重複する場合は "name copy 2.ext" 形式にする。
+    """
+
+    destination = os.path.join(directory, name)
+
+    if not os.path.lexists(destination):
+        return destination
+
+    base, extension = os.path.splitext(name)
+    number = 2
+
+    while True:
+
+        candidate = os.path.join(
+            directory,
+            "{} copy {}{}".format(base, number, extension),
+        )
+
+        if not os.path.lexists(candidate):
+            return candidate
+
+        number += 1
+
 
 # ============================================================
 # アイコン作成
 # ============================================================
 
-def make_icon(path):
-    """
-    ファイルまたはディレクトリから
-    Finder用アイコン情報を生成
-    """
+def printable(text):
+    """制御文字を ? に置き換える (画面が壊れるのを防ぐ)"""
+
+    return "".join(c if c.isprintable() else "?" for c in text)
+
+
+def make_icon(path, is_dir=None):
 
     name = os.path.basename(path)
 
-    if os.path.isdir(path):
-        symbol = DIR_SYMBOL
-        file_type = "folder"
-    else:
-        symbol = FILE_SYMBOL
-        file_type = "file"
+    if is_dir is None:
+        is_dir = os.path.isdir(path)
 
     return {
         "name": name,
+        "label": printable(name),
         "path": path,
-        "symbol": symbol,
-        "type": file_type,
-        "x": 5,
-        "y": 5,
+        "symbol": DIR_SYMBOL if is_dir else FILE_SYMBOL,
+        "type": "folder" if is_dir else "file",
+        "x": 0,
+        "y": 0,
     }
 
 
 # ============================================================
-# ディレクトリ読み込み
+# ディレクトリ読み込み (scandir: stat 回数が少なく Pi Zero 向け)
 # ============================================================
 
 def read_directory(path):
-    """
-    ディレクトリ内容を取得
-    ディレクトリを先頭に並べる
-    """
+
+    show_hidden = _show_hidden or same_path(path, TRASH_PATH)
+
+    try:
+        with os.scandir(path) as it:
+            entries = list(it)
+    except OSError:
+        return []
 
     icons = []
 
-    try:
+    for entry in entries:
 
-        names = sorted(
-            os.listdir(path),
-            key=lambda name: (
-                not os.path.isdir(
-                    os.path.join(path, name)
-                ),
-                name.lower(),
-            ),
+        if not show_hidden and entry.name.startswith("."):
+            continue
+
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+
+        icons.append(make_icon(entry.path, is_dir))
+
+    icons.sort(
+        key=lambda icon: (
+            icon["type"] != "folder",
+            icon["name"].lower(),
         )
-
-        for name in names:
-
-            full_path = os.path.join(
-                path,
-                name,
-            )
-
-            try:
-                icons.append(
-                    make_icon(full_path)
-                )
-
-            except OSError:
-                pass
-
-    except PermissionError:
-        pass
-
-    except OSError:
-        pass
+    )
 
     return icons
 
 
 # ============================================================
-# デスクトップアイコン配置
+# デスクトップ配置
 # ============================================================
 
-def arrange_icons(
-    icons,
-    width,
-    height,
-):
-    """
-    デスクトップ上へ自動配置
-    """
+def desktop_columns(width):
+    return max(1, (width - 8) // DESKTOP_COLUMN_WIDTH)
 
-    max_columns = max(
-        1,
-        (width - 8)
-        // DESKTOP_COLUMN_WIDTH
+
+def grid_position(index, width):
+
+    columns = desktop_columns(width)
+
+    return (
+        DESKTOP_MARGIN_X + (index % columns) * DESKTOP_COLUMN_WIDTH,
+        DESKTOP_MARGIN_Y + (index // columns) * DESKTOP_ROW_HEIGHT,
     )
 
+
+def arrange_icons(icons, width, height=None):
+    """全アイコンをグリッドに並べ直す (画面外はスクロールで見る)"""
+
     for i, icon in enumerate(icons):
+        icon["x"], icon["y"] = grid_position(i, width)
 
-        column = i % max_columns
-        row = i // max_columns
 
-        icon["x"] = (
-            DESKTOP_MARGIN_X
-            + column
-            * DESKTOP_COLUMN_WIDTH
-        )
+def refresh_desktop_icons(old_icons, width):
+    """
+    HOME を読み直す。
+    既存アイコンは位置を保持し、新しいものは空きマスに置く。
+    """
 
-        icon["y"] = (
-            DESKTOP_MARGIN_Y
-            + row
-            * DESKTOP_ROW_HEIGHT
-        )
+    new_icons = read_directory(HOME)
 
-        if icon["y"] >= height - 4:
-            icon["y"] = height - 5
+    old_positions = {
+        icon["path"]: (icon["x"], icon["y"])
+        for icon in old_icons
+    }
+
+    occupied = set()
+
+    for icon in new_icons:
+
+        pos = old_positions.get(icon["path"])
+
+        if pos is not None:
+            icon["x"], icon["y"] = pos
+            occupied.add(pos)
+
+    index = 0
+
+    for icon in new_icons:
+
+        if icon["path"] in old_positions:
+            continue
+
+        while grid_position(index, width) in occupied:
+            index += 1
+
+        pos = grid_position(index, width)
+        icon["x"], icon["y"] = pos
+        occupied.add(pos)
+
+    return new_icons
 
 
 # ============================================================
-# アイコンヒットテスト
+# ヒットテスト (ウィンドウ内ローカル座標用)
 # ============================================================
 
-def icon_at(
-    icons,
-    x,
-    y,
-):
-    """
-    指定座標のアイコンを返す
-    """
+def icon_at(icons, x, y, label_width, exclude=None):
 
-    for icon in icons:
+    for icon in reversed(icons):
+
+        if icon is exclude:
+            continue
 
         if (
-            icon["x"] <= x <= icon["x"] + 17
-            and
-            icon["y"] <= y <= icon["y"] + 1
+            icon["x"] <= x < icon["x"] + label_width
+            and icon["y"] <= y <= icon["y"] + 1
         ):
             return icon
 
     return None
-
-
-# ============================================================
-# フォルダ判定
-# ============================================================
-
-def is_folder(icon):
-    """
-    フォルダアイコンか判定
-    """
-
-    return (
-        icon is not None
-        and
-        icon["type"] == "folder"
-    )
-
-
-# ============================================================
-# ファイル判定
-# ============================================================
-
-def is_file(icon):
-    """
-    ファイルアイコンか判定
-    """
-
-    return (
-        icon is not None
-        and
-        icon["type"] == "file"
-    )
-
-
-# ============================================================
-# アイコン名取得
-# ============================================================
-
-def icon_name(icon):
-
-    if icon is None:
-        return ""
-
-    return icon.get("name", "")
-
-
-# ============================================================
-# アイコンパス取得
-# ============================================================
-
-def icon_path(icon):
-
-    if icon is None:
-        return ""
-
-    return icon.get("path", "")
-

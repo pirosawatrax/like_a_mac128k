@@ -1,353 +1,263 @@
 # ============================================================
 # main.py
-# Macintosh Finder
+# Macintosh Finder TUI
 #
-# Arch Linux / Raspberry Pi Zero 対応
+# Linux / Raspberry Pi Zero 対応
 # ============================================================
 
 import curses
+import locale
+import os
 
-from keyboard_mouse import (
-    KeyboardMouse,
-)
+# Esc の待ち時間を短くする (curses 初期化より前に設定すること)
+from constants import ESC_DELAY_MS
 
-from constants import (
-    HOME,
-    STARTUP_MESSAGE,
-)
+os.environ.setdefault("ESCDELAY", ESC_DELAY_MS)
 
-from filesystem import (
-    read_directory,
-    arrange_icons,
-)
-
-from desktop import (
-    draw_screen,
-)
-
+from constants import HOME, STARTUP_MESSAGE
+from filesystem import read_directory, arrange_icons
+from desktop import draw_screen, desktop_max_scroll
 from events import (
     handle_event,
+    handle_mouse_event,
+    update_mouse_position,
+    any_drag,
 )
-
-from trash import (
-    make_trash_icon,
-)
+from keyboard_mouse import KeyboardMouse
+from windows import clamp_window
 
 
 # ============================================================
-# 状態生成
+# 状態
 # ============================================================
 
-def create_state(
-    width,
-    height,
-):
+def create_state(width, height):
 
-    desktop_icons = read_directory(
-        HOME
-    )
-
-    arrange_icons(
-        desktop_icons,
-        width,
-        height,
-    )
-
-    # --------------------------------------------------------
-    # Trashアイコン
-    # --------------------------------------------------------
-
-    trash_item = make_trash_icon(
-        width - 14,
-        height - 5,
-    )
+    icons = read_directory(HOME)
+    arrange_icons(icons, width, height)
 
     return {
 
-        # ----------------------------------------------------
         # Desktop
-        # ----------------------------------------------------
+        "desktop_icons": icons,
+        "desktop_selected": None,
+        "desktop_scroll": 0,
+        "trash_selected": False,
 
-        "desktop_icons":
-            desktop_icons,
-
-        "desktop_selected":
-            None,
-
-        "desktop_dragging":
-            None,
-
-        "desktop_drag_offset_x":
-            0,
-
-        "desktop_drag_offset_y":
-            0,        
-  
-        "dragging_item": 
-			None,
-
-        "dragging_item_window": 
-			None,
-      
-        "window_icon_dragging": None,
-        "window_icon_drag_offset_x": 0,
-        "window_icon_drag_offset_y": 0,
-
-        "window_icon_press": None,
-
-        # ----------------------------------------------------
-        # Trash
-        # ----------------------------------------------------
-
-        "trash_selected":
-            False,
-
-        "trash_item":
-            trash_item,
-
-        # ----------------------------------------------------
         # Windows
-        # ----------------------------------------------------
+        "windows": [],
+        "active_window": None,
 
-        "windows":
-            [],
+        # Drag:
+        #   {"kind": "desktop" | "window_icon" | "item", "icon": ..., ...}
+        "drag": None,
+        "dragging_window": None,
+        "window_drag_offset_x": 0,
+        "window_drag_offset_y": 0,
+        "resizing_window": None,
 
-        "active_window":
-            None,
+        # Double click
+        "last_click_key": None,
+        "last_click_time": 0.0,
 
-        # ----------------------------------------------------
-        # Window Move
-        # ----------------------------------------------------
+        # Menu / Dialogs
+        "active_menu": None,
+        "dialog": None,
+        "rename": None,
+        "info": None,
 
-        "dragging_window":
-            None,
+        # Edit
+        "clipboard": None,
+        "undo": [],
 
-        "window_drag_offset_x":
-            0,
+        # Mouse / Message
+        "mouse_x": width // 2,
+        "mouse_y": height // 2,
+        "message": STARTUP_MESSAGE,
 
-        "window_drag_offset_y":
-            0,
-
-        # ----------------------------------------------------
-        # Resize
-        # ----------------------------------------------------
-
-        "resizing_window":
-            None,
-
-        # ----------------------------------------------------
-        # Double Click
-        # ----------------------------------------------------
-
-        "last_clicked":
-            None,
-
-        "last_click_time":
-            0,
-
-        # ----------------------------------------------------
-        # Menu
-        # ----------------------------------------------------
-
-        "active_menu":
-            None,
-   
-        # ----------------------------------------------------
-        # Dialog
-        # ----------------------------------------------------
-
-        "dialog":
-            None,
-        # ----------------------------------------------------
-        # Rename
-        # ----------------------------------------------------
-
-        "rename":
-            None,
-
-        # ----------------------------------------------------
-        # Get Info
-        # ----------------------------------------------------
-
-        "info":
-            None,
-        # ---------------------------------------------------
-        # clipboard
-        # --------------------------------------------------
-
-        "clipboard": 
-			None,
-
-        # ----------------------------------------------------
-        # Mouse
-        # ----------------------------------------------------
-
-        "mouse_x":
-            width // 2,
-
-        "mouse_y":
-            height // 2,
-
-        # ----------------------------------------------------
-        # Message
-        # ----------------------------------------------------
-
-        "message":
-            STARTUP_MESSAGE,
-
-        # ----------------------------------------------------
-        # Exit
-        # ----------------------------------------------------
-
-        "running":
-            True,
+        "running": True,
     }
 
 
 # ============================================================
-# Finder Main Loop
+# 端末サイズ変更
 # ============================================================
 
-def desktop_loop(
-    stdscr,
-):
+def handle_resize(stdscr, state):
 
-    curses.curs_set(0)
+    height, width = stdscr.getmaxyx()
 
-    curses.mousemask(
-        curses.ALL_MOUSE_EVENTS
-        |
-        curses.REPORT_MOUSE_POSITION
+    arrange_icons(state["desktop_icons"], width, height)
+
+    state["desktop_scroll"] = min(
+        state["desktop_scroll"],
+        desktop_max_scroll(state["desktop_icons"], height),
     )
+
+    for window in state["windows"]:
+        clamp_window(window, width, height)
+
+    update_mouse_position(
+        state, width, height, state["mouse_x"], state["mouse_y"])
+
+
+# ============================================================
+# 入力
+# ============================================================
+
+def read_key(stdscr):
+    """
+    (code, text) を返す。入力が無ければ None。
+    text: 文字なら 1 文字の str / 特殊キーなら None
+    get_wch を使うので日本語入力 (Rename) もできる。
+    """
 
     try:
+        key = stdscr.get_wch()
+    except (curses.error, UnicodeDecodeError):
+        return None
 
-        curses.mouseinterval(0)
+    if isinstance(key, str):
+        return ord(key), key
 
+    return key, None
+
+
+def modal_open(state):
+
+    return (
+        state["info"] is not None
+        or state["rename"] is not None
+        or state["dialog"] is not None
+    )
+
+
+def process_key(stdscr, state, kbm, code, text):
+
+    if code == curses.KEY_RESIZE:
+        handle_resize(stdscr, state)
+        return
+
+    height, width = stdscr.getmaxyx()
+
+    # ダイアログ表示中は WASD/G/Space を文字入力に回す
+    if not modal_open(state) and code != curses.KEY_MOUSE:
+
+        kbm.sync(state["mouse_x"], state["mouse_y"])
+
+        consumed = True
+
+        if kbm.move(code, width, height):
+            update_mouse_position(state, width, height, kbm.x, kbm.y)
+
+        elif code == curses.KEY_UP:
+            kbm.scroll_up()
+
+        elif code == curses.KEY_DOWN:
+            kbm.scroll_down()
+
+        elif code == ord(" "):
+            kbm.click()
+
+        elif code in (ord("g"), ord("G")):
+            kbm.toggle_drag()
+
+        else:
+            consumed = False
+
+        if consumed:
+            drain_virtual_mouse(stdscr, state, kbm)
+            return
+
+    handle_event(stdscr, code, text, state)
+
+    # Esc でドラッグ取り消し等があった場合に状態を合わせる
+    kbm.heal(any_drag(state))
+
+
+def drain_virtual_mouse(stdscr, state, kbm):
+
+    while kbm.queue:
+        handle_mouse_event(stdscr, state, kbm.queue.popleft())
+
+    kbm.heal(any_drag(state))
+
+
+# ============================================================
+# メインループ
+# ============================================================
+
+def setup_curses(stdscr, state):
+
+    try:
+        curses.curs_set(0)
     except curses.error:
-
         pass
 
-    height, width = (
-        stdscr.getmaxyx()
-    )
+    stdscr.keypad(True)
 
-    state = create_state(
-        width,
-        height,
-    )
-    keyboard_mouse = KeyboardMouse(
-        state["mouse_x"],
-        state["mouse_y"],
-    )
+    available, _ = curses.mousemask(
+        curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+
+    try:
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+
+    if not available:
+        state["message"] = (
+            "Mouse not available: use W/A/S/D, Space, G")
+
+
+def desktop_loop(stdscr):
+
+    height, width = stdscr.getmaxyx()
+
+    state = create_state(width, height)
+    kbm = KeyboardMouse(state["mouse_x"], state["mouse_y"])
+
+    setup_curses(stdscr, state)
+
     while state["running"]:
 
-        # ----------------------------------------------------
-        # 画面描画
-        # ----------------------------------------------------
+        draw_screen(stdscr, state)
 
-        draw_screen(
-            stdscr,
+        item = read_key(stdscr)
 
-            state["desktop_icons"],
-            state["desktop_selected"],
+        if item is None:
+            continue
 
-            state["windows"],
-            state["active_window"],
+        process_key(stdscr, state, kbm, item[0], item[1])
 
-            state["active_menu"],
+        # 溜まっている入力 (マウス移動の連打など) をまとめて処理してから
+        # 1 回だけ再描画する。Pi Zero で入力が詰まるのを防ぐ。
+        stdscr.nodelay(True)
 
-            state["trash_selected"],
+        try:
 
-            state["mouse_x"],
-            state["mouse_y"],
+            for _ in range(200):
 
-            state["message"],
-            
-            state["dialog"],
-            state["rename"],
-            state["info"],
-        )
+                if not state["running"]:
+                    break
 
-        # ----------------------------------------------------
-        # 入力
-        # ----------------------------------------------------
+                item = read_key(stdscr)
 
-        key = stdscr.getch()
-        
-        # ------------------------------------------------
-        # キーボードマウス
-        # ------------------------------------------------
+                if item is None:
+                    break
 
-        if keyboard_mouse.move(
-            key,
-            width,
-            height,
-        ):
+                process_key(stdscr, state, kbm, item[0], item[1])
 
-            state["mouse_x"] = (
-                keyboard_mouse.x
-            )
+        finally:
+            stdscr.nodelay(False)
 
-            state["mouse_y"] = (
-                keyboard_mouse.y
-            )
-
-        # ------------------------------------------------
-        # ↑ = ホイール上
-        # ------------------------------------------------
-
-        elif key == curses.KEY_UP:
-
-            keyboard_mouse.scroll_up()
-
-        # ------------------------------------------------
-        # ↓ = ホイール下
-        # ------------------------------------------------
-
-        elif key == curses.KEY_DOWN:
-
-            keyboard_mouse.scroll_down()
-
-        # ------------------------------------------------
-        # Space = 左クリック
-        # ------------------------------------------------
-
-
-        elif key == ord(" "):
-
-            keyboard_mouse.click()
-
-        # ------------------------------------------------
-        # G = 左ボタン押下 / 離す
-        # ------------------------------------------------
-
-        elif key in (ord("g"), ord("G")):
-
-            keyboard_mouse.toggle_drag()
-
-   
-        handle_event(
-            stdscr,
-            key,
-            state,
-        )       
-        
-      
-
-
-# ============================================================
-# Start
-# ============================================================
 
 def main():
 
-    curses.wrapper(
-        desktop_loop
-    )
+    # 日本語ファイル名の表示/入力に必要
+    locale.setlocale(locale.LC_ALL, "")
+
+    curses.wrapper(desktop_loop)
 
 
 if __name__ == "__main__":
-
     main()
-

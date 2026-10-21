@@ -1,539 +1,277 @@
 # ============================================================
 # trash.py
-# Macintosh Finder風 Trash 管理
+# Macintosh Finder風 Trash 管理 (XDG Trash 準拠)
 #
-# Arch Linux / Raspberry Pi OS Lite 対応
+# ~/.local/share/Trash/{files,info}
 #
-# Linux標準Trash仕様:
-#
-# ~/.local/share/Trash/
-# ├── files/
-# └── info/
-#
-# send2trash が利用可能なら send2trash を使用。
-# 利用できない場合は、このファイル自身が
-# Linux標準Trash形式でゴミ箱処理を行う。
+# 状態確認はキャッシュする (毎フレーム listdir しない: Pi Zero 対策)
 # ============================================================
 
 import os
 import shutil
+import time
 import urllib.parse
 from datetime import datetime
 
 from constants import (
+    HOME,
     TRASH_PATH,
+    TRASH_INFO_PATH,
     TRASH_SYMBOL_EMPTY,
     TRASH_SYMBOL_FULL,
 )
 
-
-# ============================================================
-# send2trash
-# ============================================================
-
 try:
-
-    from send2trash import send2trash
-
+    from send2trash import send2trash as _send2trash
     SEND2TRASH_AVAILABLE = True
-
 except ImportError:
-
     SEND2TRASH_AVAILABLE = False
 
 
-# ============================================================
-# Trashディレクトリ
-# ============================================================
+CACHE_SECONDS = 2.0
 
-TRASH_INFO_PATH = os.path.expanduser(
-    "~/.local/share/Trash/info"
-)
+_ensured = False
+_cache = {"count": 0, "time": -1e9}
 
 
+def invalidate_cache():
+    _cache["time"] = -1e9
+
+
 # ============================================================
-# Trash存在確認
+# Trash ディレクトリ
 # ============================================================
 
 def ensure_trash():
-    """
-    Linux標準Trashディレクトリを作成する。
-    """
 
-    try:
+    global _ensured
 
-        os.makedirs(
-            TRASH_PATH,
-            exist_ok=True,
-        )
-
-        os.makedirs(
-            TRASH_INFO_PATH,
-            exist_ok=True,
-        )
-
+    if _ensured and os.path.isdir(TRASH_PATH):
         return True
 
+    try:
+        os.makedirs(TRASH_PATH, exist_ok=True)
+        os.makedirs(TRASH_INFO_PATH, exist_ok=True)
     except OSError:
-
         return False
 
-
-# ============================================================
-# 重複しないファイル名を作る
-# ============================================================
-
-def unique_trash_name(name):
-    """
-    Trash/files 内で重複しない名前を生成する。
-    """
-
-    destination = os.path.join(
-        TRASH_PATH,
-        name,
-    )
-
-    if not os.path.exists(destination):
-
-        return name
-
-    base, extension = os.path.splitext(
-        name
-    )
-
-    number = 1
-
-    while True:
-
-        new_name = (
-            f"{base} ({number}){extension}"
-        )
-
-        destination = os.path.join(
-            TRASH_PATH,
-            new_name,
-        )
-
-        if not os.path.exists(destination):
-
-            return new_name
-
-        number += 1
+    _ensured = True
+    return True
 
 
-# ============================================================
-# .trashinfo ファイル名
-# ============================================================
+def list_trash():
 
-def info_filename(name):
-
-    return name + ".trashinfo"
-
-
-# ============================================================
-# .trashinfo を作成
-# ============================================================
-
-def create_trash_info(
-    trash_name,
-    original_path,
-):
-    """
-    Linux標準形式の .trashinfo を作成する。
-    """
-
-    info_path = os.path.join(
-        TRASH_INFO_PATH,
-        info_filename(trash_name),
-    )
+    if not ensure_trash():
+        return []
 
     try:
+        return sorted(os.listdir(TRASH_PATH))
+    except OSError:
+        return []
 
-        encoded_path = urllib.parse.quote(
+
+def trash_count():
+    """件数 (最大 CACHE_SECONDS 秒キャッシュ)"""
+
+    now = time.monotonic()
+
+    if now - _cache["time"] > CACHE_SECONDS:
+        _cache["count"] = len(list_trash())
+        _cache["time"] = now
+
+    return _cache["count"]
+
+
+def trash_empty():
+    return trash_count() == 0
+
+
+def trash_symbol():
+    return TRASH_SYMBOL_EMPTY if trash_empty() else TRASH_SYMBOL_FULL
+
+
+# ============================================================
+# .trashinfo
+# ============================================================
+
+def info_path_for(name):
+    return os.path.join(TRASH_INFO_PATH, name + ".trashinfo")
+
+
+def create_trash_info(trash_name, original_path):
+
+    try:
+        encoded = urllib.parse.quote(
             os.path.abspath(original_path),
             safe="/",
         )
 
-        deletion_date = datetime.now().strftime(
-            "%Y-%m-%dT%H:%M:%S"
-        )
+        date = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
-        content = (
-            "[Trash Info]\n"
-            f"Path={encoded_path}\n"
-            f"DeletionDate={deletion_date}\n"
-        )
-
-        with open(
-            info_path,
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            file.write(content)
+        with open(info_path_for(trash_name), "w", encoding="utf-8") as f:
+            f.write("[Trash Info]\nPath={}\nDeletionDate={}\n".format(
+                encoded, date))
 
         return True
 
     except OSError:
-
         return False
 
 
-# ============================================================
-# .trashinfo を読み込む
-# ============================================================
-
 def read_trash_info(name):
-    """
-    Trashアイテムの元のパスを取得する。
-    """
-
-    info_path = os.path.join(
-        TRASH_INFO_PATH,
-        info_filename(name),
-    )
-
-    if not os.path.exists(info_path):
-
-        return None
 
     try:
-
-        with open(
-            info_path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            for line in file:
-
+        with open(info_path_for(name), "r", encoding="utf-8") as f:
+            for line in f:
                 line = line.strip()
-
                 if line.startswith("Path="):
-
-                    encoded_path = line[5:]
-
-                    return urllib.parse.unquote(
-                        encoded_path
-                    )
-
+                    return urllib.parse.unquote(line[5:])
     except OSError:
-
         pass
 
     return None
 
 
+def forget_trash_item(name):
+    """Trash から外に持ち出したアイテムの .trashinfo を消す"""
+
+    try:
+        os.remove(info_path_for(name))
+    except OSError:
+        pass
+
+    invalidate_cache()
+
+
+def unique_trash_name(name):
+
+    def taken(candidate):
+        return (
+            os.path.lexists(os.path.join(TRASH_PATH, candidate))
+            or os.path.exists(info_path_for(candidate))
+        )
+
+    if not taken(name):
+        return name
+
+    base, extension = os.path.splitext(name)
+    number = 1
+
+    while True:
+
+        candidate = "{} ({}){}".format(base, number, extension)
+
+        if not taken(candidate):
+            return candidate
+
+        number += 1
+
+
 # ============================================================
-# ファイルをゴミ箱へ送る
+# ゴミ箱へ送る
 # ============================================================
 
 def move_to_trash(path):
     """
-    ファイルまたはディレクトリをTrashへ移動する。
-
-    send2trash が利用可能ならそれを使用。
-    それ以外ではLinux標準Trash形式を自前で実装。
+    ゴミ箱へ移動する。
+    成功したら Trash/files 内での名前 (Undo 用) を返す。失敗は None。
     """
-
-    if not os.path.exists(path):
-
-        return False
-
-    if not ensure_trash():
-
-        return False
 
     path = os.path.abspath(path)
 
-    try:
+    if not os.path.lexists(path):
+        return None
 
-        # ----------------------------------------------------
-        # send2trash
-        # ----------------------------------------------------
+    # 危険なものは捨てさせない
+    if path in (HOME, "/", TRASH_PATH):
+        return None
+
+    if TRASH_PATH.startswith(path + os.sep):
+        return None
+
+    if not ensure_trash():
+        return None
+
+    try:
 
         if SEND2TRASH_AVAILABLE:
 
-            send2trash(path)
+            before = set(list_trash())
+            _send2trash(path)
+            added = set(list_trash()) - before
+            invalidate_cache()
 
-            return True
+            if len(added) == 1:
+                return added.pop()
 
-        # ----------------------------------------------------
-        # Linux標準Trash形式を自前で実装
-        # ----------------------------------------------------
+            return os.path.basename(path)
 
-        original_path = path
+        name = unique_trash_name(os.path.basename(path))
+        destination = os.path.join(TRASH_PATH, name)
 
-        name = os.path.basename(path)
+        # 仕様どおり .trashinfo を先に作る
+        if not create_trash_info(name, path):
+            return None
 
-        trash_name = unique_trash_name(
-            name
-        )
+        try:
+            shutil.move(path, destination)
+        except (OSError, shutil.Error):
+            forget_trash_item(name)
+            return None
 
-        destination = os.path.join(
-            TRASH_PATH,
-            trash_name,
-        )
-
-        # ----------------------------------------------------
-        # まず元ファイルを移動
-        # ----------------------------------------------------
-
-        shutil.move(
-            path,
-            destination,
-        )
-
-        # ----------------------------------------------------
-        # .trashinfo 作成
-        # ----------------------------------------------------
-
-        if not create_trash_info(
-            trash_name,
-            original_path,
-        ):
-
-            # ------------------------------------------------
-            # .trashinfo が作れなかった場合、
-            # 元の場所へ戻す
-            # ------------------------------------------------
-
-            try:
-
-                shutil.move(
-                    destination,
-                    original_path,
-                )
-
-            except Exception:
-
-                pass
-
-            return False
-
-        return True
+        invalidate_cache()
+        return name
 
     except Exception:
-
-        return False
-
-
-# ============================================================
-# Trash内部一覧
-# ============================================================
-
-def list_trash():
-    """
-    Trash/files のアイテム一覧を取得する。
-    """
-
-    if not ensure_trash():
-
-        return []
-
-    try:
-
-        return sorted(
-            os.listdir(TRASH_PATH)
-        )
-
-    except OSError:
-
-        return []
+        invalidate_cache()
+        return None
 
 
 # ============================================================
-# ゴミ箱アイテム数
-# ============================================================
-
-def trash_count():
-
-    return len(
-        list_trash()
-    )
-
-
-# ============================================================
-# 空判定
-# ============================================================
-
-def trash_empty():
-
-    return trash_count() == 0
-
-
-# ============================================================
-# Finder用シンボル
-# ============================================================
-
-def trash_symbol():
-
-    if trash_empty():
-
-        return TRASH_SYMBOL_EMPTY
-
-    return TRASH_SYMBOL_FULL
-
-
-# ============================================================
-# Finder用アイコン
-# ============================================================
-
-def make_trash_icon(
-    x,
-    y,
-):
-    """
-    デスクトップ用Trashアイコンを生成する。
-    """
-
-    return {
-        "name": "Trash",
-        "path": TRASH_PATH,
-        "symbol": trash_symbol(),
-        "type": "trash",
-        "x": x,
-        "y": y,
-    }
-
-
-# ============================================================
-# Trashフォルダパス取得
-# ============================================================
-
-def trash_folder():
-
-    ensure_trash()
-
-    return TRASH_PATH
-
-
-# ============================================================
-# ファイル名存在確認
-# ============================================================
-
-def trash_contains(name):
-
-    path = os.path.join(
-        TRASH_PATH,
-        name,
-    )
-
-    return os.path.exists(path)
-
-
-# ============================================================
-# ゴミ箱から復元
+# 復元
 # ============================================================
 
 def restore_from_trash(name):
-    """
-    Trashから元の場所へファイルを復元する。
-    """
+    """元の場所へ戻す。成功したら戻した先のパスを返す。"""
 
     if not ensure_trash():
+        return None
 
-        return False
+    source = os.path.join(TRASH_PATH, name)
 
-    trash_file = os.path.join(
-        TRASH_PATH,
-        name,
-    )
+    if not os.path.lexists(source):
+        return None
 
-    if not os.path.exists(trash_file):
+    original = read_trash_info(name)
 
-        return False
-
-    # --------------------------------------------------------
-    # 元の場所を取得
-    # --------------------------------------------------------
-
-    original_path = read_trash_info(
-        name
-    )
-
-    if not original_path:
-
-        return False
+    if not original:
+        return None
 
     try:
 
-        # ----------------------------------------------------
-        # 元のディレクトリ
-        # ----------------------------------------------------
+        directory = os.path.dirname(original)
 
-        original_directory = os.path.dirname(
-            original_path
-        )
+        if directory:
+            os.makedirs(directory, exist_ok=True)
 
-        if original_directory:
+        destination = original
 
-            os.makedirs(
-                original_directory,
-                exist_ok=True,
-            )
+        if os.path.lexists(destination):
 
-        # ----------------------------------------------------
-        # 元の場所に同名ファイルがある場合
-        # ----------------------------------------------------
-
-        destination = original_path
-
-        if os.path.exists(destination):
-
-            base, extension = os.path.splitext(
-                original_path
-            )
-
+            base, extension = os.path.splitext(original)
             number = 1
 
-            while True:
-
-                destination = (
-                    f"{base} ({number}){extension}"
-                )
-
-                if not os.path.exists(
-                    destination
-                ):
-
-                    break
-
+            while os.path.lexists(destination):
+                destination = "{} ({}){}".format(base, number, extension)
                 number += 1
 
-        # ----------------------------------------------------
-        # 復元
-        # ----------------------------------------------------
+        shutil.move(source, destination)
 
-        shutil.move(
-            trash_file,
-            destination,
-        )
+    except (OSError, shutil.Error):
+        return None
 
-        # ----------------------------------------------------
-        # .trashinfo 削除
-        # ----------------------------------------------------
-
-        info_path = os.path.join(
-            TRASH_INFO_PATH,
-            info_filename(name),
-        )
-
-        try:
-
-            os.remove(
-                info_path
-            )
-
-        except OSError:
-
-            pass
-
-        return True
-
-    except Exception:
-
-        return False
+    forget_trash_item(name)
+    return destination
 
 
 # ============================================================
@@ -541,95 +279,31 @@ def restore_from_trash(name):
 # ============================================================
 
 def empty_trash():
-    """
-    Trash/files と Trash/info を空にする。
-    """
 
     if not ensure_trash():
-
         return False
 
     success = True
 
-    # --------------------------------------------------------
-    # Trash/files
-    # --------------------------------------------------------
+    for directory in (TRASH_PATH, TRASH_INFO_PATH):
 
-    try:
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            success = False
+            continue
 
-        for name in os.listdir(
-            TRASH_PATH
-        ):
+        for name in names:
 
-            path = os.path.join(
-                TRASH_PATH,
-                name,
-            )
+            path = os.path.join(directory, name)
 
             try:
-
-                if os.path.isdir(path):
-
+                if os.path.isdir(path) and not os.path.islink(path):
                     shutil.rmtree(path)
-
                 else:
-
                     os.remove(path)
-
             except OSError:
-
                 success = False
 
-    except OSError:
-
-        success = False
-
-    # --------------------------------------------------------
-    # Trash/info
-    # --------------------------------------------------------
-
-    try:
-
-        for name in os.listdir(
-            TRASH_INFO_PATH
-        ):
-
-            path = os.path.join(
-                TRASH_INFO_PATH,
-                name,
-            )
-
-            try:
-
-                if os.path.isfile(path):
-
-                    os.remove(path)
-
-            except OSError:
-
-                success = False
-
-    except OSError:
-
-        success = False
-
+    invalidate_cache()
     return success
-
-
-# ============================================================
-# ゴミ箱情報
-# ============================================================
-
-def trash_status():
-    """
-    Trashの状態を辞書で返す。
-    """
-
-    count = trash_count()
-
-    return {
-        "count": count,
-        "empty": count == 0,
-        "symbol": trash_symbol(),
-    }
-
